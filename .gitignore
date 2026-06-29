@@ -1,0 +1,20 @@
+bin/
+obj/
+*.log
+*.zip
+*.tmp
+*.bak
+
+# Local/generated build output
+**/bin/
+**/obj/
+
+# Windows and editor noise
+Thumbs.db
+Desktop.ini
+.vs/
+.vscode/
+
+# Local runtime artifacts
+manual-downloads/
+*.user
