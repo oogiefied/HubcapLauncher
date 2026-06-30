@@ -1393,7 +1393,7 @@ static class Scripts
   const appIdFromText = value => (String(value || "").match(/\/app\/(\d+)(?:\/|$)/)?.[1] || String(value || "").match(/store\.steampowered\.com\/app\/(\d+)(?:\/|$)/)?.[1] || "");
   const appIdFromUrl = () => appIdFromText(location.href) || appIdFromText(location.pathname) || appIdFromText(document.URL) || appIdFromText(document.querySelector('link[rel="canonical"]')?.href) || appIdFromText(document.querySelector('meta[property="og:url"]')?.content) || appIdFromText(globalThis.MainWindowBrowserManager?.m_lastLocation?.pathname || "") || appIdFromText(globalThis.MainWindowBrowserManager?.m_lastLocation?.href || "");
   function headerHost(){return document.querySelector(".apphub_HeaderStandardTop") || document.querySelector(".apphub_AppName")?.parentElement || null;}
-  function earlyHost(){return headerHost() || document.querySelector("#game_highlights")?.parentElement || document.querySelector(".game_background_glow") || document.querySelector(".game_page_background") || null;}
+  function earlyHost(){return headerHost() || document.querySelector("#game_highlights")?.parentElement || document.querySelector(".game_page_background") || document.querySelector(".game_background_glow") || null;}
   function looksLikeAppPage(){return !!(appIdFromUrl()||headerHost()||document.querySelector("#game_highlights")||document.querySelector(".game_page_background"));}
   function placeRoot() {
     const host = earlyHost();
@@ -1407,6 +1407,7 @@ static class Scripts
     const highlights = document.querySelector("#game_highlights");
     if (title?.parentElement === host && title.nextElementSibling !== root) title.insertAdjacentElement("afterend", root);
     else if (highlights?.parentElement === host && root.parentElement !== host) host.insertBefore(root, highlights);
+    else if (host.classList?.contains("game_page_background") && root.parentElement !== host) host.prepend(root);
     else if (root.parentElement !== host) host.appendChild(root);
     return true;
   }
@@ -1445,7 +1446,7 @@ static class Scripts
   }
   if(window.__hubcapCdpRouteTimer)clearInterval(window.__hubcapCdpRouteTimer);
   let lastHubcapAppId=appIdFromUrl();
-  if(!lastHubcapAppId)window.__hubcapCdpSetState({busy:true,busyText:"Checking...",statusText:""});
+  window.__hubcapCdpSetState({busy:true,busyText:"Checking...",statusText:"",usageBusy:true});
   hydrateCachedUsage();
   if(lastHubcapAppId)setTimeout(()=>send("route"),0);
   window.__hubcapCdpRouteTimer=setInterval(()=>{const nextAppId=appIdFromUrl();placeRoot();if(!nextAppId&&lastHubcapAppId){lastHubcapAppId="";window.__hubcapCdpSetState({busy:true,busyText:"Checking...",statusText:""});return;}if(nextAppId&&nextAppId!==lastHubcapAppId){lastHubcapAppId=nextAppId;send("route");}},150);
