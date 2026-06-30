@@ -599,6 +599,24 @@ sealed class HubcapLauncher
                     });
                     return;
 
+                case "libraryCheck":
+                    var libraryCheck = _hubcap.OpenLua(appId);
+                    if (libraryCheck.Success)
+                    {
+                        await RefreshLibraryStateAsync(cdp, visibleAppId);
+                    }
+                    else
+                    {
+                        await SetLibraryStateAsync(cdp, new LibraryUiState
+                        {
+                            AppId = appId,
+                            Exists = _hubcap.HasLua(appId, out _),
+                            StatusText = libraryCheck.Error,
+                            StatusTone = "error"
+                        });
+                    }
+                    return;
+
                 case "library":
                     SteamLauncher.OpenLibraryApp(appId);
                     return;
@@ -986,6 +1004,27 @@ sealed class HubcapService
         catch (Exception ex)
         {
             return Task.FromResult(new ActionResult(false, ex.Message));
+        }
+    }
+
+    public ActionResult OpenLua(string appId)
+    {
+        try
+        {
+            var config = EnsureLuaCache();
+            var luaPath = Path.Combine(config.LuaDir, $"{appId}.lua");
+            if (!File.Exists(luaPath))
+            {
+                MarkLua(appId, exists: false);
+                return new ActionResult(false, "Lua file no longer exists.");
+            }
+
+            Process.Start(new ProcessStartInfo(luaPath) { UseShellExecute = true });
+            return new ActionResult(true, "");
+        }
+        catch (Exception ex)
+        {
+            return new ActionResult(false, ex.Message);
         }
     }
 
@@ -1457,6 +1496,7 @@ static class Scripts
     public const string SharedLibraryUi = """
 (() => {
   const BUTTON_ID = "hubcap-cdp-library-remove";
+  const CHECK_BUTTON_ID = "hubcap-cdp-library-check";
   const STATUS_ID = "hubcap-cdp-library-status";
   const STYLE_ID = "hubcap-cdp-library-style";
 
@@ -1480,11 +1520,13 @@ static class Scripts
   }
 
   function ensureStyle(doc) {
-    if (doc.getElementById(STYLE_ID)) return;
-    const style = doc.createElement("style");
+    const style = doc.getElementById(STYLE_ID) || doc.createElement("style");
     style.id = STYLE_ID;
     style.textContent = `
-      #${BUTTON_ID}{align-items:center;align-self:center;background:rgba(95,33,31,.58);border:1px solid rgba(217,75,63,.36);border-radius:3px;box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 1px 2px rgba(0,0,0,.24);color:#ffe0dc;cursor:pointer;display:inline-flex;font:14px Arial,Helvetica,sans-serif;height:32px;justify-content:center;line-height:1;margin-right:8px;min-width:104px;padding:0 14px;text-align:center;transform:translateY(3px);white-space:nowrap}
+      #${CHECK_BUTTON_ID}{align-items:center;align-self:center;appearance:none;background:rgba(13,27,39,.48);border:1px solid rgba(103,193,245,.26);border-radius:3px;box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 1px 2px rgba(0,0,0,.24);box-sizing:border-box;color:#d6f4ff;cursor:pointer;display:inline-flex;font:14px Arial,Helvetica,sans-serif;height:32px;justify-content:center;line-height:1;margin:0 8px 0 0;min-height:32px;min-width:104px;padding:0 14px;text-align:center;transform:translateY(3px);vertical-align:middle;white-space:nowrap}
+      #${CHECK_BUTTON_ID}:hover{background:rgba(26,52,70,.62);border-color:rgba(103,193,245,.42);color:#fff}
+      #${CHECK_BUTTON_ID}:disabled{cursor:default;opacity:.72}
+      #${BUTTON_ID}{align-items:center;align-self:center;appearance:none;background:rgba(95,33,31,.58);border:1px solid rgba(217,75,63,.36);border-radius:3px;box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 1px 2px rgba(0,0,0,.24);box-sizing:border-box;color:#ffe0dc;cursor:pointer;display:inline-flex;font:14px Arial,Helvetica,sans-serif;height:32px;justify-content:center;line-height:1;margin:0 8px 0 0;min-height:32px;min-width:104px;padding:0 14px;text-align:center;transform:translateY(3px);vertical-align:middle;white-space:nowrap}
       #${BUTTON_ID}:hover{background:rgba(112,42,39,.72);border-color:rgba(217,75,63,.5);color:#fff1ef}
       #${BUTTON_ID}:disabled{cursor:default;opacity:.72}
       #${BUTTON_ID}[data-removed="true"]{animation:hubcap-library-fade-out 1.8s ease forwards;background:rgba(38,72,42,.58);border-color:rgba(139,197,63,.36);color:#dff5cf}
@@ -1492,12 +1534,12 @@ static class Scripts
       #${STATUS_ID}[data-tone="error"]{color:#ff9b8f}
       @keyframes hubcap-library-fade-out{0%,45%{opacity:1}100%{opacity:0}}
     `;
-    doc.head.appendChild(style);
+    if (!style.parentElement) doc.head.appendChild(style);
   }
 
   function removeElements(doc) {
     if (!doc) return;
-    doc.querySelectorAll(`#${BUTTON_ID},#${STATUS_ID}`).forEach(el => el.remove());
+    doc.querySelectorAll(`#${CHECK_BUTTON_ID},#${BUTTON_ID},#${STATUS_ID}`).forEach(el => el.remove());
   }
 
   function actionAnchorElement(doc) {
@@ -1534,7 +1576,7 @@ static class Scripts
     element.style.marginRight = "8px";
     const anchorX = anchor.getBoundingClientRect().x;
     const before = Array.from(row.children)
-      .filter(child => child.id !== BUTTON_ID && child.id !== STATUS_ID)
+      .filter(child => child.id !== CHECK_BUTTON_ID && child.id !== BUTTON_ID && child.id !== STATUS_ID)
       .filter(child => Math.abs(child.getBoundingClientRect().y - anchor.getBoundingClientRect().y) < 16)
       .filter(child => child.getBoundingClientRect().x >= anchorX - 8)
       .sort((a, b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x)[0] || anchor;
@@ -1555,6 +1597,27 @@ static class Scripts
     globalThis.__hubcapLastLibraryState = state.removed ? null : state;
 
     if (state.exists) {
+      const checkButton = doc.createElement("button");
+      checkButton.id = CHECK_BUTTON_ID;
+      checkButton.type = "button";
+      checkButton.dataset.appId = state.appId || routeAppId();
+      checkButton.textContent = "Edit Lua";
+      checkButton.title = `Edit Lua for app ${checkButton.dataset.appId}`;
+      checkButton.addEventListener("click", event => {
+        event.preventDefault();
+        event.stopPropagation();
+        checkButton.disabled = true;
+        checkButton.textContent = "Opening...";
+        send("libraryCheck", checkButton.dataset.appId);
+        setTimeout(() => {
+          if (checkButton.isConnected) {
+            checkButton.disabled = false;
+            checkButton.textContent = "Edit Lua";
+          }
+        }, 1200);
+      });
+      placeInActionBar(doc, checkButton);
+
       const button = doc.createElement("button");
       button.id = BUTTON_ID;
       button.type = "button";
@@ -1616,7 +1679,7 @@ static class Scripts
     if (!appId) return;
     const win = desktopWindow();
     if (win?.document) {
-      const current = win.document.getElementById(BUTTON_ID) || win.document.getElementById(STATUS_ID);
+      const current = win.document.getElementById(CHECK_BUTTON_ID) || win.document.getElementById(BUTTON_ID) || win.document.getElementById(STATUS_ID);
       if (current && current.dataset.appId !== appId) removeElements(win.document);
       if (!current && globalThis.__hubcapLastLibraryState?.appId === appId && !globalThis.__hubcapLastLibraryState?.removed) {
         globalThis.__hubcapLibrarySetState(globalThis.__hubcapLastLibraryState);
