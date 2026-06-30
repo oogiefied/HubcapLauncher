@@ -24,7 +24,7 @@ It brings Steam Store and Library Lua controls to users who want Hubcap function
 - Shows a Library-side `Remove Lua` button for games that already have Lua installed.
 - Shows a Hubcap usage panel with username, API key expiry, daily usage count, progress bar, and loading spinner.
 - Refreshes Hubcap usage on page load, after download, and when clicked manually.
-- Runs as a standalone Windows launcher executable without Millennium.
+- Runs as a standalone 64-bit Windows launcher executable without Millennium.
 - Launches or restarts Steam with DevTools/CDP support, then exits automatically when Steam closes.
 
 ## Screenshots
@@ -55,7 +55,7 @@ Library Remove:
 
 ## Requirements
 
-- Windows
+- 64-bit Windows
 - Steam
 - HubcapTool
 - A HubcapLauncher executable, or the .NET 9 SDK if building from source

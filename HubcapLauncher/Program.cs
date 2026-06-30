@@ -231,16 +231,16 @@ static class SteamLauncher
 {
     public static async Task EnsureDevModeSteamAsync(HttpClient http, int devToolsPort, bool forceRestart)
     {
-        if (await IsDevToolsReachableAsync(http, devToolsPort))
-        {
-            Logger.Info("Steam with Hubcap patch is already running.");
-            return;
-        }
-
         if (forceRestart)
         {
             StopSteam();
             StartSteam(devToolsPort);
+            return;
+        }
+
+        if (await IsDevToolsReachableAsync(http, devToolsPort))
+        {
+            Logger.Info("Steam with Hubcap patch is already running.");
             return;
         }
 
@@ -338,12 +338,13 @@ static class UserPrompts
         const uint MB_OK = 0x00000000;
         const uint MB_ICONERROR = 0x00000010;
         const uint MB_TOPMOST = 0x00040000;
+        const uint MB_SETFOREGROUND = 0x00010000;
 
         MessageBoxW(
-            IntPtr.Zero,
+            WindowOwner.GetBestOwner(),
             message,
             "HubcapLauncher",
-            MB_OK | MB_ICONERROR | MB_TOPMOST);
+            MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
     }
 
     public static void NotifyPatchAlreadyRunning()
@@ -351,12 +352,13 @@ static class UserPrompts
         const uint MB_OK = 0x00000000;
         const uint MB_ICONINFORMATION = 0x00000040;
         const uint MB_TOPMOST = 0x00040000;
+        const uint MB_SETFOREGROUND = 0x00010000;
 
         MessageBoxW(
-            IntPtr.Zero,
+            WindowOwner.GetBestOwner(),
             "Steam with Hubcap patch is already running.",
             "HubcapLauncher",
-            MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
+            MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
     }
 
     public static bool ConfirmRestartSteamForDevTools()
@@ -364,19 +366,301 @@ static class UserPrompts
         const uint MB_YESNO = 0x00000004;
         const uint MB_ICONWARNING = 0x00000030;
         const uint MB_TOPMOST = 0x00040000;
+        const uint MB_SETFOREGROUND = 0x00010000;
         const int IDYES = 6;
 
         var result = MessageBoxW(
-            IntPtr.Zero,
+            WindowOwner.GetBestOwner(),
             "Steam is currently not in dev mode.\n\nSwitch Steam to dev mode so HubcapLauncher can add the buttons?\n\nSteam will restart.",
             "HubcapLauncher",
-            MB_YESNO | MB_ICONWARNING | MB_TOPMOST);
+            MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
 
         return result == IDYES;
     }
 
+    public static bool ConfirmRestartLauncherForLuaFolder()
+    {
+        const uint MB_YESNO = 0x00000004;
+        const uint MB_ICONWARNING = 0x00000030;
+        const uint MB_TOPMOST = 0x00040000;
+        const uint MB_SETFOREGROUND = 0x00010000;
+        const int IDYES = 6;
+
+        MessageBeep(MB_ICONWARNING);
+        var result = MessageBoxW(
+            WindowOwner.GetBestOwner(),
+            "Lua folder changed.\n\nRestart HubcapLauncher and Steam now so the new folder is used?\n\nSteam will reopen in dev mode.",
+            "HubcapLauncher",
+            MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+
+        return result == IDYES;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool MessageBeep(uint uType);
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern int MessageBoxW(IntPtr hWnd, string text, string caption, uint type);
+}
+
+static class LauncherRestarter
+{
+    public static void RestartFullLauncherAndExit()
+    {
+        var exe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName;
+        if (string.IsNullOrWhiteSpace(exe) || !File.Exists(exe))
+            throw new InvalidOperationException("Could not find HubcapLauncher.exe to restart.");
+
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = exe,
+            Arguments = "--allow-multiple --quiet --restart-steam",
+            UseShellExecute = true,
+            WindowStyle = ProcessWindowStyle.Hidden
+        });
+
+        Environment.Exit(0);
+    }
+}
+
+static class ClipboardHelper
+{
+    private const uint CF_UNICODETEXT = 13;
+    private const uint GMEM_MOVEABLE = 0x0002;
+
+    public static void SetText(string text)
+    {
+        if (!OpenClipboard(IntPtr.Zero))
+            throw new InvalidOperationException("Could not open Windows clipboard.");
+
+        var handle = IntPtr.Zero;
+        try
+        {
+            EmptyClipboard();
+            var bytes = Encoding.Unicode.GetBytes(text + '\0');
+            handle = GlobalAlloc(GMEM_MOVEABLE, (UIntPtr)bytes.Length);
+            if (handle == IntPtr.Zero)
+                throw new InvalidOperationException("Could not allocate clipboard memory.");
+
+            var pointer = GlobalLock(handle);
+            if (pointer == IntPtr.Zero)
+                throw new InvalidOperationException("Could not lock clipboard memory.");
+
+            try
+            {
+                Marshal.Copy(bytes, 0, pointer, bytes.Length);
+            }
+            finally
+            {
+                GlobalUnlock(handle);
+            }
+
+            if (SetClipboardData(CF_UNICODETEXT, handle) == IntPtr.Zero)
+                throw new InvalidOperationException("Could not set clipboard data.");
+
+            handle = IntPtr.Zero;
+        }
+        finally
+        {
+            CloseClipboard();
+            if (handle != IntPtr.Zero) GlobalFree(handle);
+        }
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool OpenClipboard(IntPtr hWndNewOwner);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool EmptyClipboard();
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool CloseClipboard();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GlobalLock(IntPtr hMem);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GlobalUnlock(IntPtr hMem);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GlobalFree(IntPtr hMem);
+}
+
+static class FolderPicker
+{
+    public static string? Pick(string initialFolder)
+    {
+        if (Thread.CurrentThread.GetApartmentState() == ApartmentState.STA)
+            return PickOnSta(initialFolder);
+
+        string? selected = null;
+        Exception? error = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                selected = PickOnSta(initialFolder);
+            }
+            catch (Exception ex)
+            {
+                error = ex;
+            }
+        });
+
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+
+        if (error is not null) throw error;
+        return selected;
+    }
+
+    private static string? PickOnSta(string initialFolder)
+    {
+        var dialogType = Type.GetTypeFromCLSID(new Guid("DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7"));
+        if (dialogType is null) throw new InvalidOperationException("Windows folder picker is unavailable.");
+
+        var dialog = (IFileOpenDialog)Activator.CreateInstance(dialogType)!;
+        try
+        {
+            const uint FOS_PICKFOLDERS = 0x00000020;
+            const uint FOS_FORCEFILESYSTEM = 0x00000040;
+            const uint FOS_PATHMUSTEXIST = 0x00000800;
+            const uint FOS_NOCHANGEDIR = 0x00000008;
+
+            dialog.GetOptions(out var options);
+            dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR);
+            dialog.SetTitle("Select Lua Folder");
+            dialog.SetOkButtonLabel("Select Folder");
+
+            if (Directory.Exists(initialFolder) &&
+                SHCreateItemFromParsingName(initialFolder, IntPtr.Zero, typeof(IShellItem).GUID, out var initialItem) == 0)
+            {
+                dialog.SetFolder(initialItem);
+            }
+
+            var owner = WindowOwner.GetBestOwner();
+            var hr = dialog.Show(owner);
+            if (hr == unchecked((int)0x800704C7)) return null;
+            if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+
+            dialog.GetResult(out var item);
+            item.GetDisplayName(SIGDN_FILESYSPATH, out var pathPtr);
+            try
+            {
+                var selectedPath = Marshal.PtrToStringUni(pathPtr);
+                if (string.IsNullOrWhiteSpace(selectedPath)) return null;
+                return selectedPath;
+            }
+            finally
+            {
+                Marshal.FreeCoTaskMem(pathPtr);
+            }
+        }
+        finally
+        {
+            Marshal.ReleaseComObject(dialog);
+        }
+    }
+
+    private const uint SIGDN_FILESYSPATH = 0x80058000;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private readonly struct COMDLG_FILTERSPEC
+    {
+        [MarshalAs(UnmanagedType.LPWStr)]
+        private readonly string _name;
+
+        [MarshalAs(UnmanagedType.LPWStr)]
+        private readonly string _spec;
+
+        public COMDLG_FILTERSPEC(string name, string spec)
+        {
+            _name = name;
+            _spec = spec;
+        }
+    }
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = true)]
+    private static extern int SHCreateItemFromParsingName(
+        string pszPath,
+        IntPtr pbc,
+        [MarshalAs(UnmanagedType.LPStruct)] Guid riid,
+        [MarshalAs(UnmanagedType.Interface)] out IShellItem ppv);
+
+    [ComImport]
+    [Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IShellItem
+    {
+        void BindToHandler(IntPtr pbc, [MarshalAs(UnmanagedType.LPStruct)] Guid bhid, [MarshalAs(UnmanagedType.LPStruct)] Guid riid, out IntPtr ppv);
+        void GetParent(out IShellItem ppsi);
+        void GetDisplayName(uint sigdnName, out IntPtr ppszName);
+        void GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);
+        void Compare(IShellItem psi, uint hint, out int piOrder);
+    }
+
+    [ComImport]
+    [Guid("D57C7288-D4AD-4768-BE02-9D969532D960")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IFileOpenDialog
+    {
+        [PreserveSig] int Show(IntPtr parent);
+        void SetFileTypes(uint cFileTypes, [MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 0)] COMDLG_FILTERSPEC[] rgFilterSpec);
+        void SetFileTypeIndex(uint iFileType);
+        void GetFileTypeIndex(out uint piFileType);
+        void Advise(IntPtr pfde, out uint pdwCookie);
+        void Unadvise(uint dwCookie);
+        void SetOptions(uint fos);
+        void GetOptions(out uint pfos);
+        void SetDefaultFolder(IShellItem psi);
+        void SetFolder(IShellItem psi);
+        void GetFolder(out IShellItem ppsi);
+        void GetCurrentSelection(out IShellItem ppsi);
+        void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string pszName);
+        void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string pszName);
+        void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string pszTitle);
+        void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string pszText);
+        void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string pszLabel);
+        void GetResult(out IShellItem ppsi);
+        void AddPlace(IShellItem psi, uint fdap);
+        void SetDefaultExtension([MarshalAs(UnmanagedType.LPWStr)] string pszDefaultExtension);
+        void Close(int hr);
+        void SetClientGuid([MarshalAs(UnmanagedType.LPStruct)] Guid guid);
+        void ClearClientData();
+        void SetFilter(IntPtr pFilter);
+        void GetResults(out IntPtr ppenum);
+        void GetSelectedItems(out IntPtr ppsai);
+    }
+}
+
+static class WindowOwner
+{
+    public static IntPtr GetBestOwner()
+    {
+        var foreground = GetForegroundWindow();
+        if (foreground != IntPtr.Zero) return foreground;
+
+        foreach (var name in new[] { "steamwebhelper", "steam" })
+        {
+            foreach (var process in Process.GetProcessesByName(name))
+            {
+                if (process.MainWindowHandle != IntPtr.Zero)
+                    return process.MainWindowHandle;
+            }
+        }
+
+        return IntPtr.Zero;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
 }
 
 sealed class HubcapLauncher
@@ -576,6 +860,53 @@ sealed class HubcapLauncher
             var evt = JsonSerializer.Deserialize<HubcapEvent>(raw, JsonOptions.Default);
             if (evt is null) return;
 
+            switch (evt.Action)
+            {
+                case "settings":
+                    await SetStateAsync(cdp, new UiState { SettingsOnly = true, Settings = _hubcap.GetSettings() });
+                    return;
+
+                case "openLuaFolder":
+                    var currentSettings = _hubcap.GetSettings();
+                    var chosenFolder = _hubcap.ChooseLuaFolder();
+                    var folderChanged = string.IsNullOrWhiteSpace(chosenFolder.Error) && chosenFolder.LuaDir != currentSettings.LuaDir;
+                    await SetStateAsync(cdp, new UiState
+                    {
+                        SettingsOnly = true,
+                        Settings = chosenFolder,
+                        SettingsDraft = folderChanged,
+                        StatusText = folderChanged ? "Folder selected. Save to apply." : chosenFolder.Error,
+                        StatusTone = string.IsNullOrWhiteSpace(chosenFolder.Error) ? "idle" : "error",
+                        StatusError = !string.IsNullOrWhiteSpace(chosenFolder.Error)
+                    });
+                    return;
+
+                case "saveSettings":
+                    var savedSettings = _hubcap.SaveSettings(evt.LuaDir, evt.ApiKey);
+                    await SetStateAsync(cdp, new UiState
+                    {
+                        SettingsOnly = true,
+                        Settings = savedSettings,
+                        SettingsDraft = !string.IsNullOrWhiteSpace(savedSettings.Error),
+                        StatusText = string.IsNullOrWhiteSpace(savedSettings.Error) ? "Saved." : savedSettings.Error,
+                        StatusTone = string.IsNullOrWhiteSpace(savedSettings.Error) ? "success" : "error",
+                        StatusError = !string.IsNullOrWhiteSpace(savedSettings.Error)
+                    });
+                    if (string.IsNullOrWhiteSpace(savedSettings.Error) &&
+                        savedSettings.LuaDirChanged &&
+                        UserPrompts.ConfirmRestartLauncherForLuaFolder())
+                    {
+                        LauncherRestarter.RestartFullLauncherAndExit();
+                    }
+                    return;
+
+                case "copyApiKey":
+                    var copyKey = _hubcap.CopyApiKeyToClipboard();
+                    if (!copyKey.Success)
+                        await SetStateAsync(cdp, new UiState { SettingsOnly = true, Settings = _hubcap.GetSettings(), StatusText = copyKey.Error, StatusTone = "error", StatusError = true });
+                    return;
+            }
+
             var visibleAppId = !string.IsNullOrWhiteSpace(evt.AppId) ? evt.AppId : AppIdFromUrl(evt.Href);
             if (string.IsNullOrWhiteSpace(visibleAppId)) return;
 
@@ -680,7 +1011,7 @@ sealed class HubcapLauncher
         }
         catch (Exception ex)
         {
-            await SetStateAsync(cdp, new UiState { UsageOnly = true, Usage = new UsageState { Error = ex.Message } });
+            await SetStateAsync(cdp, new UiState { UsageOnly = true, Usage = new UsageState { Error = ex.Message, ErrorLabel = "Stats Error" } });
         }
     }
 
@@ -776,6 +1107,7 @@ sealed class HubcapLauncher
 
 sealed class HubcapService
 {
+    private const string ConfigMissingMessage = "Config file not found. Make sure HubcapTools is installed.";
     private readonly HttpClient _http;
     private readonly object _cacheLock = new();
     private readonly ConcurrentDictionary<string, CachedStatusResult> _statusCache = new();
@@ -857,6 +1189,7 @@ sealed class HubcapService
                 StatusText = ex.Message,
                 StatusTone = "error",
                 StatusError = true,
+                ControlsDisabled = true,
                 Usage = null
             };
         }
@@ -890,7 +1223,11 @@ sealed class HubcapService
             request.Headers.Authorization = new("Bearer", config.ApiKey);
             using var response = await _http.SendAsync(request);
             if (!response.IsSuccessStatusCode)
-                return new UsageState { Error = ErrorForStatus(response.StatusCode) };
+                return new UsageState
+                {
+                    Error = await ErrorForResponseAsync(response),
+                    ErrorLabel = UsageErrorLabel(response.StatusCode)
+                };
 
             var json = JsonNode.Parse(await response.Content.ReadAsStringAsync());
             var usage = new UsageState
@@ -906,7 +1243,7 @@ sealed class HubcapService
         }
         catch (Exception ex)
         {
-            return new UsageState { Error = ex.Message };
+            return new UsageState { Error = ex.Message, ErrorLabel = "Stats Error" };
         }
     }
 
@@ -1028,6 +1365,134 @@ sealed class HubcapService
         }
     }
 
+    public SettingsState GetSettings()
+    {
+        try
+        {
+            var configPath = GetConfigPath();
+            if (!File.Exists(configPath))
+                return MissingConfigSettings(configPath);
+
+            return ReadSettings(configPath);
+        }
+        catch (Exception ex)
+        {
+            return new SettingsState { Error = ex.Message };
+        }
+    }
+
+    public SettingsState ChooseLuaFolder()
+    {
+        try
+        {
+            var settings = GetSettings();
+            if (settings.ConfigMissing) return settings;
+
+            var currentLuaDir = NormalizeBackslashes(settings.LuaDir);
+            var initialFolder = Directory.Exists(currentLuaDir)
+                ? currentLuaDir
+                : Path.Combine(FindSteamRoot(), "config");
+            var selected = FolderPicker.Pick(initialFolder);
+            if (string.IsNullOrWhiteSpace(selected)) return GetSettings();
+
+            return new SettingsState
+            {
+                LuaDir = ToConfigPath(NormalizeBackslashes(selected)),
+                ApiKey = settings.ApiKey
+            };
+        }
+        catch (Exception ex)
+        {
+            var settings = GetSettings();
+            settings.Error = ex.Message;
+            return settings;
+        }
+    }
+
+    public SettingsState SaveSettings(string luaDir, string apiKey)
+    {
+        var luaDirChanged = false;
+        try
+        {
+            var configPath = GetConfigPath();
+            if (!File.Exists(configPath))
+                throw new InvalidOperationException(ConfigMissingMessage);
+
+            var previousSettings = ReadSettings(configPath);
+            var previousLuaDir = NormalizeBackslashes(previousSettings.LuaDir);
+
+            luaDir = NormalizeBackslashes(Environment.ExpandEnvironmentVariables((luaDir ?? "").Trim()));
+            apiKey = (apiKey ?? "").Trim();
+            var luaDirWasBlank = string.IsNullOrWhiteSpace(luaDir);
+            if (luaDirWasBlank)
+                luaDir = DefaultLuaDir();
+            if (string.IsNullOrWhiteSpace(apiKey))
+                throw new InvalidOperationException("API key is required.");
+            if (!luaDirWasBlank && !Directory.Exists(luaDir))
+                throw new InvalidOperationException("Lua folder does not exist.");
+            luaDirChanged = !string.Equals(previousLuaDir, luaDir, StringComparison.OrdinalIgnoreCase);
+
+            var lines = File.Exists(configPath) ? File.ReadAllLines(configPath).ToList() : [];
+            var updatedLuaDir = false;
+            var updatedApiKey = false;
+            for (var i = 0; i < lines.Count; i++)
+            {
+                var parts = lines[i].Split(':', 2);
+                if (parts.Length != 2) continue;
+                var key = parts[0].Trim();
+                if (key == "HubcapLuaDir")
+                {
+                    lines[i] = $"HubcapLuaDir: {QuoteConfigValue(ToConfigPath(luaDir))}";
+                    updatedLuaDir = true;
+                }
+                else if (key == "HubcapApiKey")
+                {
+                    lines[i] = $"HubcapApiKey: {QuoteConfigValue(apiKey)}";
+                    updatedApiKey = true;
+                }
+            }
+
+            if (!updatedApiKey) lines.Add($"HubcapApiKey: {QuoteConfigValue(apiKey)}");
+            if (!updatedLuaDir) lines.Add($"HubcapLuaDir: {QuoteConfigValue(ToConfigPath(luaDir))}");
+            File.WriteAllLines(configPath, lines);
+
+            lock (_cacheLock)
+            {
+                _cachedConfig = null;
+                _cachedConfigKey = "";
+                _luaWatcher?.Dispose();
+                _luaWatcher = null;
+            }
+
+            var settings = GetSettings();
+            settings.LuaDirChanged = luaDirChanged;
+            return settings;
+        }
+        catch (Exception ex)
+        {
+            var settings = GetSettings();
+            settings.LuaDir = ToConfigPath(NormalizeBackslashes(luaDir ?? settings.LuaDir));
+            settings.ApiKey = apiKey ?? settings.ApiKey;
+            settings.Error = ex.Message;
+            settings.LuaDirChanged = false;
+            return settings;
+        }
+    }
+
+    public ActionResult CopyApiKeyToClipboard()
+    {
+        try
+        {
+            var config = EnsureLuaCache();
+            ClipboardHelper.SetText(config.ApiKey);
+            return new ActionResult(true, "");
+        }
+        catch (Exception ex)
+        {
+            return new ActionResult(false, ex.Message);
+        }
+    }
+
     private static void DeleteMarkerFiles(string steamRoot, string manifestDir, string appId)
     {
         foreach (var marker in new[]
@@ -1077,7 +1542,12 @@ sealed class HubcapService
     {
         try
         {
-            Directory.CreateDirectory(luaDir);
+            if (!Directory.Exists(luaDir))
+            {
+                Logger.Info($"Lua watcher unavailable: folder not found: {luaDir}");
+                return;
+            }
+
             _luaWatcher?.Dispose();
             _luaWatcher = new FileSystemWatcher(luaDir, "*.lua")
             {
@@ -1125,10 +1595,9 @@ sealed class HubcapService
 
     private static HubcapConfig ReadConfig()
     {
-        var steamRoot = FindSteamRoot();
-        var configPath = Path.Combine(steamRoot, "config", "hubcaptools", "config.yaml");
+        var configPath = GetConfigPath();
         if (!File.Exists(configPath))
-            throw new InvalidOperationException($"HubcapTool config.yaml not found at {configPath}");
+            throw new InvalidOperationException(ConfigMissingMessage);
 
         string apiKey = "";
         string luaDir = "";
@@ -1139,13 +1608,51 @@ sealed class HubcapService
             var key = parts[0].Trim();
             var value = Unquote(parts[1].Trim());
             if (key == "HubcapApiKey") apiKey = value;
-            if (key == "HubcapLuaDir") luaDir = Environment.ExpandEnvironmentVariables(value);
+            if (key == "HubcapLuaDir") luaDir = NormalizeBackslashes(Environment.ExpandEnvironmentVariables(value));
         }
 
-        if (string.IsNullOrWhiteSpace(apiKey)) throw new InvalidOperationException($"HubcapApiKey is missing in {configPath}");
-        if (string.IsNullOrWhiteSpace(luaDir)) throw new InvalidOperationException($"HubcapLuaDir is missing in {configPath}");
+        if (string.IsNullOrWhiteSpace(apiKey)) throw new InvalidOperationException("API Key missing.");
+        if (string.IsNullOrWhiteSpace(luaDir)) luaDir = DefaultLuaDir();
         return new HubcapConfig(apiKey, luaDir);
     }
+
+    private static SettingsState ReadSettings(string configPath)
+    {
+        string apiKey = "";
+        string luaDir = "";
+        foreach (var line in File.ReadLines(configPath))
+        {
+            var parts = line.Split(':', 2);
+            if (parts.Length != 2) continue;
+            var key = parts[0].Trim();
+            var value = Unquote(parts[1].Trim());
+            if (key == "HubcapApiKey") apiKey = value;
+            if (key == "HubcapLuaDir") luaDir = NormalizeBackslashes(Environment.ExpandEnvironmentVariables(value));
+        }
+
+        if (string.IsNullOrWhiteSpace(luaDir)) luaDir = DefaultLuaDir();
+        return new SettingsState
+        {
+            LuaDir = ToConfigPath(luaDir),
+            ApiKey = apiKey,
+            Error = string.IsNullOrWhiteSpace(apiKey) ? "API Key missing." : ""
+        };
+    }
+
+    private static string GetConfigPath()
+    {
+        var steamRoot = FindSteamRoot();
+        return Path.Combine(steamRoot, "config", "hubcaptools", "config.yaml");
+    }
+
+    private static string DefaultLuaDir() => Path.Combine(FindSteamRoot(), "config", "hubcap-lua");
+
+    private static SettingsState MissingConfigSettings(string configPath) => new()
+    {
+        ConfigMissing = true,
+        ConfigPath = DisplayPath(configPath),
+        Error = ConfigMissingMessage
+    };
 
     public static string FindSteamRoot()
     {
@@ -1177,11 +1684,57 @@ sealed class HubcapService
             File.Exists(Path.Combine(path, "steam.exe"));
     }
 
+    private static string DisplayPath(string path) => ToConfigPath(path);
+
+    private static string NormalizeBackslashes(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return "";
+        value = value.Trim();
+        var isUnc = value.StartsWith(@"\\");
+        value = value.Replace('/', '\\');
+        while (value.Contains(@"\\"))
+            value = value.Replace(@"\\", @"\");
+        return isUnc && !value.StartsWith(@"\\") ? @"\" + value : value;
+    }
+
     private static string Unquote(string value)
     {
-        if ((value.StartsWith('"') && value.EndsWith('"')) || (value.StartsWith('\'') && value.EndsWith('\'')))
+        if (value.StartsWith('"') && value.EndsWith('"'))
+            return UnescapeConfigValue(value[1..^1]);
+        if (value.StartsWith('\'') && value.EndsWith('\''))
             return value[1..^1];
         return value;
+    }
+
+    private static string QuoteConfigValue(string value) =>
+        $"\"{value.Replace("\"", "\\\"")}\"";
+
+    private static string ToConfigPath(string value) => value.Replace('\\', '/');
+
+    private static string UnescapeConfigValue(string value)
+    {
+        var builder = new StringBuilder(value.Length);
+        for (var i = 0; i < value.Length; i++)
+        {
+            if (value[i] == '\\' && i + 1 < value.Length)
+            {
+                var next = value[++i];
+                builder.Append(next switch
+                {
+                    '\\' => '\\',
+                    '"' => '"',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    _ => $"\\{next}"
+                });
+                continue;
+            }
+
+            builder.Append(value[i]);
+        }
+
+        return builder.ToString();
     }
 
     private static void TryDeleteDirectory(string path)
@@ -1204,6 +1757,37 @@ sealed class HubcapService
         System.Net.HttpStatusCode.ServiceUnavailable => "Hubcap service unavailable. Try again later.",
         System.Net.HttpStatusCode.GatewayTimeout => "Hubcap request timed out. Try again later.",
         _ => $"Hubcap returned HTTP {(int)status}."
+    };
+
+    private static async Task<string> ErrorForResponseAsync(HttpResponseMessage response)
+    {
+        var fallback = ErrorForStatus(response.StatusCode);
+        try
+        {
+            var body = await response.Content.ReadAsStringAsync();
+            if (string.IsNullOrWhiteSpace(body)) return fallback;
+            var json = JsonNode.Parse(body);
+            return json?["detail"]?.GetValue<string>() ??
+                json?["message"]?.GetValue<string>() ??
+                json?["error"]?.GetValue<string>() ??
+                fallback;
+        }
+        catch
+        {
+            return fallback;
+        }
+    }
+
+    private static string UsageErrorLabel(System.Net.HttpStatusCode status) => status switch
+    {
+        System.Net.HttpStatusCode.Unauthorized => "API Key Error",
+        System.Net.HttpStatusCode.Forbidden => "Access Error",
+        (System.Net.HttpStatusCode)429 => "Limit Reached",
+        System.Net.HttpStatusCode.InternalServerError or
+            System.Net.HttpStatusCode.BadGateway or
+            System.Net.HttpStatusCode.ServiceUnavailable or
+            System.Net.HttpStatusCode.GatewayTimeout => "Server Error",
+        _ => "Stats Error"
     };
 }
 
@@ -1295,7 +1879,7 @@ sealed record HubcapConfig(string ApiKey, string LuaDir);
 sealed record StatusResult(bool Success, bool Available, string Error);
 sealed record CachedStatusResult(StatusResult Result, DateTimeOffset ExpiresAt);
 sealed record ActionResult(bool Success, string Error);
-sealed record HubcapEvent(string Action, string AppId, string Href);
+sealed record HubcapEvent(string Action, string AppId, string Href, string LuaDir = "", string ApiKey = "");
 sealed record StoreWatchdogState(string AppId, bool HasUi, bool HasSetter);
 
 sealed class UiState
@@ -1314,6 +1898,20 @@ sealed class UiState
     public bool UsageOnly { get; set; }
     public bool UsageBusy { get; set; }
     public UsageState? Usage { get; set; }
+    public bool ControlsDisabled { get; set; }
+    public bool SettingsOnly { get; set; }
+    public SettingsState? Settings { get; set; }
+    public bool SettingsDraft { get; set; }
+}
+
+sealed class SettingsState
+{
+    public string LuaDir { get; set; } = "";
+    public string ApiKey { get; set; } = "";
+    public string Error { get; set; } = "";
+    public bool ConfigMissing { get; set; }
+    public string ConfigPath { get; set; } = "";
+    public bool LuaDirChanged { get; set; }
 }
 
 sealed class LibraryUiState
@@ -1332,6 +1930,7 @@ sealed class UsageState
     public int DailyLimit { get; set; }
     public string ApiKeyExpiresAt { get; set; } = "";
     public string Error { get; set; } = "";
+    public string ErrorLabel { get; set; } = "";
 }
 
 static class JsonOptions
@@ -1405,30 +2004,56 @@ static class Scripts
     #${ROOT_ID} button[data-state="download"][data-denuvo="true"]:hover{background:rgba(129,72,30,.72);border-color:rgba(246,162,58,.5);color:#fff5e6}
     #${ROOT_ID} button[data-state="remove"]{background:rgba(95,33,31,.58);border-color:rgba(217,75,63,.36);color:#ffe0dc;opacity:1}
     #${ROOT_ID} button[data-state="remove"]:hover{background:rgba(112,42,39,.72);border-color:rgba(217,75,63,.5);color:#fff1ef}
+    #${ROOT_ID} button[data-state="disabled"]{background:rgba(13,27,39,.32);border-color:rgba(180,198,210,.18);color:rgba(214,244,255,.56);opacity:1}
+    #${ROOT_ID} button[data-state="disabled"]:hover{background:rgba(13,27,39,.32);border-color:rgba(180,198,210,.18);color:rgba(214,244,255,.56)}
     #${ROOT_ID} .hp-status{color:#acdbf5;font:12px Arial,Helvetica,sans-serif;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     #${ROOT_ID} .hp-status[data-tone="error"]{color:#ff9b8f;font-weight:700}
     #${ROOT_ID} .hp-status[data-tone="success"]{color:#a4d007;font-weight:700}
     #${ROOT_ID} .hp-warning{color:#f7c46c;display:none;font:12px Arial,Helvetica,sans-serif;font-weight:700;white-space:nowrap}
     #${ROOT_ID} .hp-warning[data-visible="true"]{display:inline-flex}
-    #${ROOT_ID} .hp-usage{background:rgba(13,27,39,.48);border:1px solid rgba(103,193,245,.26);border-radius:3px;color:#d6f4ff;cursor:pointer;font-family:Arial,Helvetica,sans-serif;min-width:190px;padding:7px 10px 8px}
+    #${ROOT_ID} .hp-usage{background:rgba(13,27,39,.48);border:1px solid rgba(103,193,245,.26);border-radius:3px;color:#d6f4ff;cursor:pointer;font-family:Arial,Helvetica,sans-serif;min-width:190px;padding:7px 10px 8px;position:relative}
     #${ROOT_ID} .hp-usage-row,#${ROOT_ID} .hp-usage-bottom{align-items:center;display:flex;gap:8px;justify-content:space-between}
     #${ROOT_ID} .hp-usage-row{font-size:12px}
-    #${ROOT_ID} .hp-usage-bottom{font-size:12px;justify-content:flex-end;margin-top:5px}
+    #${ROOT_ID} .hp-usage-bottom{font-size:12px;justify-content:space-between;margin-top:5px}
+    #${ROOT_ID} .hp-usage-count-wrap{align-items:center;display:inline-flex;gap:6px;margin-left:auto}
     #${ROOT_ID} .hp-usage-name{color:#fff;font-weight:700}
     #${ROOT_ID} .hp-usage-expiry{color:#9fc9e0;font-size:11px}
     #${ROOT_ID} .hp-usage-bar{background:rgba(0,0,0,.26);border-radius:999px;height:4px;margin-top:6px;overflow:hidden}
     #${ROOT_ID} .hp-usage-fill{background:linear-gradient(90deg,#a4d007 0%,#67c1f5 100%);display:block;height:100%;width:0%}
     #${ROOT_ID} .hp-usage-spinner{animation:hubcap-cdp-spin .8s linear infinite;border:2px solid rgba(214,244,255,.28);border-top-color:#d6f4ff;border-radius:50%;display:none;height:10px;width:10px}
     #${ROOT_ID} .hp-usage-spinner[data-visible="true"]{display:inline-flex}
+    #${ROOT_ID} .hp-settings-button{align-items:center;background:rgba(13,27,39,.38);border:1px solid rgba(103,193,245,.18);border-radius:3px;color:#9fc9e0;cursor:pointer;display:inline-flex;font:13px Arial,Helvetica,sans-serif;height:18px;justify-content:center;min-height:18px;min-width:18px;padding:0;width:18px}
+    #${ROOT_ID} .hp-settings-button:hover{background:rgba(26,52,70,.72);border-color:rgba(103,193,245,.42);color:#fff}
+    #${ROOT_ID} .hp-settings{background:rgba(13,27,39,.96);border:1px solid rgba(103,193,245,.3);border-radius:3px;box-shadow:0 8px 24px rgba(0,0,0,.38);color:#d6f4ff;display:none;font-family:Arial,Helvetica,sans-serif;min-width:360px;padding:10px;position:absolute;right:0;top:calc(100% + 8px);z-index:999999}
+    #${ROOT_ID} .hp-settings[data-visible="true"]{display:block}
+    #${ROOT_ID} .hp-settings-head{align-items:center;display:flex;font-size:12px;font-weight:700;justify-content:space-between;margin-bottom:9px}
+    #${ROOT_ID} .hp-settings-close{align-items:center;background:transparent;border:0;box-shadow:none;color:#9fc9e0;cursor:pointer;display:inline-flex;font:16px Arial,Helvetica,sans-serif;height:20px;justify-content:center;min-height:20px;min-width:20px;padding:0;width:20px}
+    #${ROOT_ID} .hp-settings-close:hover{background:rgba(255,255,255,.08);color:#fff}
+    #${ROOT_ID} .hp-field{display:grid;gap:4px;margin-top:8px}
+    #${ROOT_ID} .hp-field label{color:#9fc9e0;font-size:11px;font-weight:700}
+    #${ROOT_ID} .hp-field-row{align-items:center;display:flex;gap:6px}
+    #${ROOT_ID} .hp-field input{background:rgba(0,0,0,.24);border:1px solid rgba(103,193,245,.2);border-radius:2px;color:#d6f4ff;font:12px Consolas,monospace;height:28px;min-width:0;padding:0 8px;width:100%}
+    #${ROOT_ID} .hp-icon-button{align-items:center;background:rgba(13,27,39,.48);border:1px solid rgba(103,193,245,.26);border-radius:3px;color:#d6f4ff;cursor:pointer;display:inline-flex;font:13px Arial,Helvetica,sans-serif;height:28px;justify-content:center;min-height:28px;min-width:30px;padding:0;width:30px}
+    #${ROOT_ID} .hp-icon-button:hover{background:rgba(26,52,70,.62);border-color:rgba(103,193,245,.42);color:#fff}
+    #${ROOT_ID} .hp-config-missing{display:none;gap:10px;margin-top:8px}
+    #${ROOT_ID} .hp-config-missing[data-visible="true"]{display:grid}
+    #${ROOT_ID} .hp-config-missing-text{color:#ff9b8f;font-size:12px;font-weight:700;line-height:1.35}
+    #${ROOT_ID} .hp-settings-note{color:#9fc9e0;font-size:11px;min-height:14px;margin-top:8px}
+    #${ROOT_ID} .hp-settings-note[data-tone="error"]{color:#ff9b8f;font-weight:700}
+    #${ROOT_ID} .hp-settings-note[data-tone="success"]{color:#a4d007;font-weight:700}
+    #${ROOT_ID} .hp-settings-actions{align-items:center;display:flex;justify-content:flex-end;margin-top:8px}
+    #${ROOT_ID} .hp-save-settings{background:rgba(13,27,39,.48);border:1px solid rgba(103,193,245,.26);border-radius:3px;color:#d6f4ff;cursor:pointer;display:none;font:12px Arial,Helvetica,sans-serif;height:28px;min-height:28px;min-width:64px;padding:0 12px}
+    #${ROOT_ID} .hp-save-settings[data-visible="true"]{display:inline-flex}
+    #${ROOT_ID} .hp-save-settings:hover{background:rgba(26,52,70,.62);border-color:rgba(103,193,245,.42);color:#fff}
     @keyframes hubcap-cdp-spin{to{transform:rotate(360deg)}}
   `;
   document.head.appendChild(style);
   const existingRoot = document.getElementById(ROOT_ID);
   const root = existingRoot || document.createElement("div");
   root.id = ROOT_ID;
-  if (!existingRoot) root.innerHTML = `
+  if (!existingRoot || !root.querySelector(".hp-settings-button") || !root.querySelector(".hp-config-missing") || root.querySelector(".hp-open-config-file")) root.innerHTML = `
     <div class="hp-left"><button class="hp-main" type="button" data-state="checking" disabled>Checking...</button><button class="hp-library" type="button" style="display:none">Go to Library</button><span class="hp-status"></span><span class="hp-warning"></span></div>
-    <div class="hp-right"><div class="hp-usage"><div class="hp-usage-row"><span class="hp-usage-name">Hubcap</span><span class="hp-usage-expiry">Expires --</span></div><div class="hp-usage-bar"><span class="hp-usage-fill"></span></div><div class="hp-usage-bottom">Daily Usage: <strong class="hp-usage-count">--/--</strong><span class="hp-usage-spinner"></span></div></div></div>`;
+    <div class="hp-right"><div class="hp-usage"><div class="hp-usage-row"><span class="hp-usage-name">Hubcap</span><span class="hp-usage-expiry">Expires --</span></div><div class="hp-usage-bar"><span class="hp-usage-fill"></span></div><div class="hp-usage-bottom"><button class="hp-settings-button" type="button" title="Hubcap settings">&#9881;</button><span class="hp-usage-count-wrap">Daily Usage: <strong class="hp-usage-count">--/--</strong><span class="hp-usage-spinner"></span></span></div><div class="hp-settings"><div class="hp-settings-head"><span>Hubcap Settings</span><button class="hp-settings-close" type="button" title="Close">&times;</button></div><div class="hp-config-missing"><div class="hp-config-missing-text">Config file not found. Make sure HubcapTools is installed.</div></div><div class="hp-field"><label>Lua Folder</label><div class="hp-field-row"><input class="hp-lua-dir" type="text"><button class="hp-icon-button hp-open-lua-folder" type="button" title="Select Lua folder">&#128193;</button></div></div><div class="hp-field"><label>API Key</label><div class="hp-field-row"><input class="hp-api-key" type="password"><button class="hp-icon-button hp-toggle-api-key" type="button" title="Show API key">&#128065;</button><button class="hp-icon-button hp-copy-api-key" type="button" title="Copy API key">&#128203;</button></div></div><div class="hp-settings-note"></div><div class="hp-settings-actions"><button class="hp-save-settings" type="button">Save</button></div></div></div></div>`;
   const appIdFromText = value => (String(value || "").match(/\/app\/(\d+)(?:\/|$)/)?.[1] || String(value || "").match(/store\.steampowered\.com\/app\/(\d+)(?:\/|$)/)?.[1] || "");
   const appIdFromUrl = () => appIdFromText(location.href) || appIdFromText(location.pathname) || appIdFromText(document.URL) || appIdFromText(document.querySelector('link[rel="canonical"]')?.href) || appIdFromText(document.querySelector('meta[property="og:url"]')?.content) || appIdFromText(globalThis.MainWindowBrowserManager?.m_lastLocation?.pathname || "") || appIdFromText(globalThis.MainWindowBrowserManager?.m_lastLocation?.href || "");
   function headerHost(){return document.querySelector(".apphub_HeaderStandardTop") || document.querySelector(".apphub_AppName")?.parentElement || null;}
@@ -1451,14 +2076,62 @@ static class Scripts
     return true;
   }
   placeRoot();
-  const send = action => {
-    const payload = JSON.stringify({ action, appId: appIdFromUrl(), href: location.href });
+  const send = (action, extra = {}) => {
+    const payload = JSON.stringify({ action, appId: appIdFromUrl(), href: location.href, ...extra });
     if (typeof window.hubcapNative === "function") window.hubcapNative(payload);
     else console.warn("[Hubcap CDP] native binding unavailable", payload);
   };
+  function setSettingsNote(message, tone = "idle") {
+    const note = root.querySelector(".hp-settings-note");
+    if (!note) return;
+    note.textContent = message || "";
+    note.dataset.tone = tone;
+  }
+  function updateSaveState() {
+    const luaDir = root.querySelector(".hp-lua-dir");
+    const apiKey = root.querySelector(".hp-api-key");
+    const save = root.querySelector(".hp-save-settings");
+    if (!luaDir || !apiKey || !save) return;
+    save.dataset.visible = hasSettingsChanges() ? "true" : "false";
+  }
+  function hasSettingsChanges() {
+    const luaDir = root.querySelector(".hp-lua-dir");
+    const apiKey = root.querySelector(".hp-api-key");
+    return !!luaDir && !!apiKey && (luaDir.value !== (root.dataset.luaDir || "") || apiKey.value !== (root.dataset.apiKey || ""));
+  }
+  function showSettings(settings, draft = false) {
+    const panel = root.querySelector(".hp-settings");
+    const luaDir = root.querySelector(".hp-lua-dir");
+    const apiKey = root.querySelector(".hp-api-key");
+    if (!panel || !luaDir || !apiKey) return;
+    panel.dataset.visible = "true";
+    const missing = !!settings?.configMissing;
+    root.querySelector(".hp-config-missing").dataset.visible = missing ? "true" : "false";
+    root.querySelectorAll(".hp-field").forEach(field => field.style.display = missing ? "none" : "grid");
+    root.querySelector(".hp-settings-actions").style.display = missing ? "none" : "flex";
+    if (missing) {
+      luaDir.value = "";
+      apiKey.value = "";
+      root.dataset.luaDir = "";
+      root.dataset.apiKey = "";
+      setSettingsNote("");
+      updateSaveState();
+      return;
+    }
+    luaDir.value = settings?.luaDir || "";
+    apiKey.value = settings?.apiKey || "";
+    if (!draft) {
+      root.dataset.luaDir = luaDir.value;
+      root.dataset.apiKey = apiKey.value;
+    }
+    apiKey.type = "password";
+    setSettingsNote(settings?.error || "", settings?.error ? "error" : "idle");
+    updateSaveState();
+  }
   window.__hubcapCdpSetState = state => {
     placeRoot();
     const button=root.querySelector(".hp-main"), library=root.querySelector(".hp-library"), status=root.querySelector(".hp-status"), warning=root.querySelector(".hp-warning"), usage=root.querySelector(".hp-usage"), name=root.querySelector(".hp-usage-name"), expiry=root.querySelector(".hp-usage-expiry"), count=root.querySelector(".hp-usage-count"), fill=root.querySelector(".hp-usage-fill"), spinner=root.querySelector(".hp-usage-spinner");
+    if(state.settingsOnly){showSettings(state.settings||{},!!state.settingsDraft);if(state.statusText)setSettingsNote(state.statusText,state.statusTone||"idle");return;}
     const denuvo=/denuvo|anti[-\s]?tamper/i.test(document.body?.innerText||"");
     warning.textContent="Warning: Denuvo / 3rd-party anti-tamper detected";
     warning.dataset.visible=denuvo?"true":"false"; button.dataset.denuvo=denuvo?"true":"false";
@@ -1468,8 +2141,10 @@ static class Scripts
     if(state.exists){button.dataset.state="remove";button.textContent="Remove Lua";button.disabled=false;library.style.display="inline-flex";}
     else if(state.available){button.dataset.state="download";button.textContent="Download Lua";button.disabled=false;library.style.display="none";}
     else{button.dataset.state="unavailable";button.textContent="Unavailable";button.disabled=true;library.style.display="none";}
+    if(state.controlsDisabled){button.dataset.state="disabled";button.disabled=true;library.disabled=true;}
+    else{library.disabled=false;}
     status.textContent=state.isDlc&&state.statusText?state.statusText:(state.statusError&&state.statusText&&!/lua unavailable/i.test(state.statusText)?state.statusText:"");status.dataset.tone=state.statusTone||(state.statusError?"error":"idle");if(state.usage)updateUsage(state);else spinner.dataset.visible=state.usageBusy?"true":"false";
-    function updateUsage(s){const u=s.usage||{},du=Number(u.dailyUsage||0),dl=Number(u.dailyLimit||0);name.textContent=u.username||"Hubcap";count.textContent=u.error?"Limit Error":`${du}/${dl}`;fill.style.width=`${dl>0?Math.min(100,Math.round((du/dl)*100)):0}%`;usage.title=u.error||"";spinner.dataset.visible=s.usageBusy?"true":"false";if(u.apiKeyExpiresAt){const days=Math.max(0,Math.ceil((new Date(u.apiKeyExpiresAt).getTime()-Date.now())/86400000));expiry.textContent=`Expires in ${days}d`;}else if(u.error){expiry.textContent="Expires --";}if(s.usage&&!u.error)try{sessionStorage.setItem(USAGE_CACHE_KEY,JSON.stringify(u));}catch{}}
+    function updateUsage(s){const u=s.usage||{},du=Number(u.dailyUsage||0),dl=Number(u.dailyLimit||0);name.textContent=u.username||"Hubcap";count.textContent=u.error?(u.errorLabel||"Stats Error"):`${du}/${dl}`;fill.style.width=`${dl>0?Math.min(100,Math.round((du/dl)*100)):0}%`;usage.title=u.error||"";spinner.dataset.visible=s.usageBusy?"true":"false";if(u.apiKeyExpiresAt){const days=Math.max(0,Math.ceil((new Date(u.apiKeyExpiresAt).getTime()-Date.now())/86400000));expiry.textContent=`Expires in ${days}d`;}else if(u.error){expiry.textContent="Expires --";}if(s.usage&&!u.error)try{sessionStorage.setItem(USAGE_CACHE_KEY,JSON.stringify(u));}catch{}}
   };
   function hydrateCachedUsage(){
     try{
@@ -1481,6 +2156,16 @@ static class Scripts
     root.querySelector(".hp-main").addEventListener("click",()=>{const state=root.querySelector(".hp-main").dataset.state;if(state==="download")send("download");if(state==="remove")send("remove");});
     root.querySelector(".hp-library").addEventListener("click",()=>send("library"));
     root.querySelector(".hp-usage").addEventListener("click",()=>send("refresh"));
+    root.querySelector(".hp-settings-button").addEventListener("click",event=>{event.preventDefault();event.stopPropagation();setSettingsNote("Loading...");root.querySelector(".hp-settings").dataset.visible="true";send("settings");});
+    root.querySelector(".hp-settings").addEventListener("click",event=>event.stopPropagation());
+    root.querySelector(".hp-settings-close").addEventListener("click",event=>{event.preventDefault();event.stopPropagation();root.querySelector(".hp-settings").dataset.visible="false";});
+    root.querySelector(".hp-open-lua-folder").addEventListener("click",event=>{event.preventDefault();event.stopPropagation();setSettingsNote("Selecting Lua folder...");send("openLuaFolder");});
+    root.querySelector(".hp-lua-dir").addEventListener("input",updateSaveState);
+    root.querySelector(".hp-api-key").addEventListener("input",updateSaveState);
+    root.querySelector(".hp-save-settings").addEventListener("click",event=>{event.preventDefault();event.stopPropagation();setSettingsNote("Saving...");send("saveSettings",{luaDir:root.querySelector(".hp-lua-dir").value||"",apiKey:root.querySelector(".hp-api-key").value||""});});
+    root.querySelector(".hp-toggle-api-key").addEventListener("click",event=>{event.preventDefault();event.stopPropagation();const input=root.querySelector(".hp-api-key");input.type=input.type==="password"?"text":"password";});
+    root.querySelector(".hp-copy-api-key").addEventListener("click",async event=>{event.preventDefault();event.stopPropagation();const value=root.querySelector(".hp-api-key").value||"";try{await navigator.clipboard.writeText(value);setSettingsNote("API key copied.");}catch{send("copyApiKey");setSettingsNote("API key copied.");}});
+    document.addEventListener("click",event=>{const panel=root.querySelector(".hp-settings"),button=root.querySelector(".hp-settings-button");if(panel?.dataset.visible==="true"&&!panel.contains(event.target)&&!button?.contains(event.target)&&!hasSettingsChanges())panel.dataset.visible="false";},true);
     root.dataset.bound = "true";
   }
   if(window.__hubcapCdpRouteTimer)clearInterval(window.__hubcapCdpRouteTimer);
@@ -1530,7 +2215,8 @@ static class Scripts
       #${BUTTON_ID}:hover{background:rgba(112,42,39,.72);border-color:rgba(217,75,63,.5);color:#fff1ef}
       #${BUTTON_ID}:disabled{cursor:default;opacity:.72}
       #${BUTTON_ID}[data-removed="true"]{animation:hubcap-library-fade-out 1.8s ease forwards;background:rgba(38,72,42,.58);border-color:rgba(139,197,63,.36);color:#dff5cf}
-      #${STATUS_ID}{align-items:center;align-self:center;color:#8bc53f;display:inline-flex;font:700 14px/32px Arial,Helvetica,sans-serif;height:32px;justify-content:center;margin-right:8px;min-width:104px;padding:0 14px;text-shadow:0 1px 2px rgba(0,0,0,.55);transform:translateY(3px);white-space:nowrap}
+      #${STATUS_ID}{align-items:center;align-self:center;color:#ff9b8f;display:inline-flex;font:700 14px/32px Arial,Helvetica,sans-serif;height:32px;justify-content:center;margin-right:8px;min-width:104px;padding:0 14px;text-shadow:0 1px 2px rgba(0,0,0,.55);transform:translateY(3px);white-space:nowrap}
+      #${STATUS_ID}[data-tone="success"]{color:#8bc53f}
       #${STATUS_ID}[data-tone="error"]{color:#ff9b8f}
       @keyframes hubcap-library-fade-out{0%,45%{opacity:1}100%{opacity:0}}
     `;

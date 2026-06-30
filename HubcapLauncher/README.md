@@ -54,7 +54,7 @@ Library Remove:
 .\publish-win-x64.ps1
 ```
 
-The published single-file exe is:
+The published 64-bit single-file exe is:
 
 ```text
 bin\Release\net9.0\win-x64\publish\HubcapLauncher.exe

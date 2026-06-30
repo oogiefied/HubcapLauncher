@@ -1,6 +1,8 @@
 $ErrorActionPreference = "Stop"
 
 $project = Join-Path $PSScriptRoot "HubcapLauncher.csproj"
+$publishDir = Join-Path $PSScriptRoot "bin\Release\net9.0\win-x64\publish"
+
 dotnet publish $project `
     -c Release `
     -r win-x64 `
@@ -11,4 +13,4 @@ dotnet publish $project `
 
 Write-Host ""
 Write-Host "Published:"
-Write-Host (Join-Path $PSScriptRoot "bin\Release\net9.0\win-x64\publish\HubcapLauncher.exe")
+Write-Host (Join-Path $publishDir "HubcapLauncher.exe")
