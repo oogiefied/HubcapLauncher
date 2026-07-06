@@ -57,7 +57,7 @@ Library Remove:
 The published 64-bit single-file exe is:
 
 ```text
-bin\Release\net9.0\win-x64\publish\HubcapLauncher.exe
+bin\Release\net9.0-windows10.0.17763.0\win-x64\publish\HubcapLauncher.exe
 ```
 
 The published exe uses the Windows subsystem, so normal double-click runs do not keep a console window open.
@@ -70,7 +70,7 @@ The published exe uses the Windows subsystem, so normal double-click runs do not
 4. Run `HubcapLauncher.exe`.
 
 ```powershell
-.\bin\Release\net9.0\win-x64\publish\HubcapLauncher.exe
+.\bin\Release\net9.0-windows10.0.17763.0\win-x64\publish\HubcapLauncher.exe
 ```
 
 If Steam is closed, HubcapLauncher starts Steam in dev mode automatically. If Steam is already open but not in dev mode, HubcapLauncher asks to restart Steam in dev mode.

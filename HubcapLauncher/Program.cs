@@ -1,11 +1,16 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO.Compression;
+using System.Net;
 using System.Net.WebSockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
+using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.WinForms;
 using Microsoft.Win32;
 
 const int DevToolsPort = 8080;
@@ -640,6 +645,854 @@ static class FolderPicker
     }
 }
 
+static class SteamDbManifestPicker
+{
+    public static List<LuaManifestOptionState> Pick(string depotId, string currentManifestId)
+    {
+        if (Thread.CurrentThread.GetApartmentState() == ApartmentState.STA)
+            return PickOnSta(depotId, currentManifestId);
+
+        List<LuaManifestOptionState>? options = null;
+        Exception? error = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                options = PickOnSta(depotId, currentManifestId);
+            }
+            catch (Exception ex)
+            {
+                error = ex;
+            }
+        });
+
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+
+        if (error is not null) throw error;
+        return options ?? [];
+    }
+
+    private static List<LuaManifestOptionState> PickOnSta(string depotId, string currentManifestId)
+    {
+        var result = new List<LuaManifestOptionState>();
+        using var form = new System.Windows.Forms.Form
+        {
+            Text = $"SteamDB Manifests - Depot {depotId}",
+            Width = 900,
+            Height = 660,
+            StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen,
+            MinimizeBox = false,
+            MaximizeBox = true,
+            ShowInTaskbar = true,
+            TopMost = true
+        };
+
+        var webView = new WebView2 { Dock = System.Windows.Forms.DockStyle.Fill };
+        var bottom = new System.Windows.Forms.Panel
+        {
+            Dock = System.Windows.Forms.DockStyle.Bottom,
+            Height = 44,
+            Padding = new System.Windows.Forms.Padding(8)
+        };
+        var status = new System.Windows.Forms.Label
+        {
+            AutoSize = false,
+            Dock = System.Windows.Forms.DockStyle.Fill,
+            Text = "Loading SteamDB...",
+            TextAlign = System.Drawing.ContentAlignment.MiddleLeft
+        };
+        var useButton = new System.Windows.Forms.Button
+        {
+            Text = "Use visible manifests",
+            Dock = System.Windows.Forms.DockStyle.Right,
+            Width = 150,
+            Enabled = false
+        };
+        var cancelButton = new System.Windows.Forms.Button
+        {
+            Text = "Cancel",
+            Dock = System.Windows.Forms.DockStyle.Right,
+            Width = 82
+        };
+        bottom.Controls.Add(status);
+        bottom.Controls.Add(cancelButton);
+        bottom.Controls.Add(useButton);
+        form.Controls.Add(webView);
+        form.Controls.Add(bottom);
+
+        var latest = new List<LuaManifestOptionState>();
+        var timer = new System.Windows.Forms.Timer { Interval = 1200 };
+        var timeout = new System.Windows.Forms.Timer { Interval = 120000 };
+
+        async Task ExtractAsync(bool closeOnSuccess)
+        {
+            if (webView.CoreWebView2 is null) return;
+            try
+            {
+                var json = await webView.CoreWebView2.ExecuteScriptAsync("""
+(() => {
+  const text = document.body?.innerText || "";
+  const rows = [];
+  const seen = new Set();
+  const datePattern = "\\d{1,2}\\s+[A-Za-z]+\\s+\\d{4}(?:\\s+[\\u2013\\u2014-]\\s+\\d{2}:\\d{2}(?::\\d{2})?\\s+UTC|,\\s+[A-Za-z]{3},\\s+\\d{2}:\\d{2}|\\s+[A-Za-z]{3}\\s+\\d{2}:\\d{2})";
+  const dateRe = new RegExp(datePattern, "i");
+  const manifestRe = /\b\d{12,20}\b/g;
+  const add = (manifestId, date) => {
+    manifestId = String(manifestId || "").trim();
+    date = String(date || "").trim();
+    if (!/^\d{12,20}$/.test(manifestId) || seen.has(manifestId)) return;
+    seen.add(manifestId);
+    rows.push({ manifestId, date });
+  };
+  const dateFrom = value => (String(value || "").match(dateRe) || [""])[0];
+  const display = text.match(/Displaying manifest\s+(\d{12,20})\s+dated\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4}\s+[–—-]\s+\d{2}:\d{2}:\d{2}\s+UTC)/i);
+  if (display) add(display[1], display[2]);
+  const displayFallback = text.match(new RegExp("Displaying manifest\\s+(\\d{12,20})\\s+dated\\s+(" + datePattern + ")", "i"));
+  if (displayFallback) add(displayFallback[1], displayFallback[2]);
+
+  for (const link of document.querySelectorAll("a[href], a")) {
+    const combined = `${link.textContent || ""} ${link.getAttribute("href") || ""}`;
+    const manifestIds = combined.match(manifestRe) || [];
+    if (!manifestIds.length) continue;
+    const row = link.closest("tr") || link.closest("li") || link.parentElement;
+    let date = dateFrom(row?.innerText || "");
+    if (!date && row?.previousElementSibling) date = dateFrom(row.previousElementSibling.innerText || "");
+    for (const manifestId of manifestIds) add(manifestId, date);
+  }
+
+  for (const row of document.querySelectorAll("tr")) {
+    const rowText = row.innerText || "";
+    const date = dateFrom(rowText);
+    const manifestIds = rowText.match(manifestRe) || [];
+    for (const manifestId of manifestIds) add(manifestId, date);
+  }
+  const start = text.search(/Previously seen manifests/i);
+  const section = start >= 0 ? text.slice(start) : text;
+  const re = /(\d{1,2}\s+[A-Za-z]+\s+\d{4}\s+[–—-]\s+\d{2}:\d{2}:\d{2}\s+UTC)\s+(\d{12,20})/gi;
+  let match;
+  while ((match = re.exec(section)) !== null) add(match[2], match[1]);
+  const lines = section.split(/\n+/).map(line => line.trim()).filter(Boolean);
+  let lastDate = "";
+  for (const line of lines) {
+    const date = dateFrom(line);
+    if (date) lastDate = date;
+    const manifestIds = line.match(manifestRe) || [];
+    for (const manifestId of manifestIds) add(manifestId, lastDate);
+  }
+  return rows;
+})()
+""");
+                var rows = JsonSerializer.Deserialize<List<SteamDbManifestRow>>(json, JsonOptions.Default) ?? [];
+                latest = RowsToOptions(rows, currentManifestId);
+                if (latest.Count > 0)
+                {
+                    useButton.Enabled = true;
+                    status.Text = $"Found {latest.Count} manifest rows. Importing...";
+                    if (closeOnSuccess && latest.Count > 1)
+                    {
+                        result = latest;
+                        timer.Stop();
+                        form.Close();
+                    }
+                }
+                else
+                {
+                    status.Text = "No manifest rows found yet. Finish any browser check, then use visible manifests.";
+                }
+            }
+            catch (Exception ex)
+            {
+                status.Text = $"Could not read page yet: {ex.Message}";
+            }
+        }
+
+        useButton.Click += async (_, _) =>
+        {
+            await ExtractAsync(closeOnSuccess: false);
+            result = latest;
+            form.Close();
+        };
+        cancelButton.Click += (_, _) =>
+        {
+            result = [];
+            form.Close();
+        };
+        timer.Tick += async (_, _) => await ExtractAsync(closeOnSuccess: true);
+        timeout.Tick += (_, _) =>
+        {
+            timeout.Stop();
+            result = latest;
+            form.Close();
+        };
+        form.FormClosed += (_, _) =>
+        {
+            timer.Stop();
+            timeout.Stop();
+        };
+
+        form.Shown += async (_, _) =>
+        {
+            try
+            {
+                form.WindowState = System.Windows.Forms.FormWindowState.Normal;
+                form.Show();
+                form.BringToFront();
+                form.Activate();
+                _ = Task.Delay(2500).ContinueWith(_ =>
+                {
+                    if (!form.IsDisposed)
+                    {
+                        try { form.BeginInvoke(() => form.TopMost = false); } catch { }
+                    }
+                });
+                timeout.Start();
+                var userDataFolder = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "HubcapLauncher",
+                    "SteamDbWebView2");
+                Directory.CreateDirectory(userDataFolder);
+                var environment = await CoreWebView2Environment.CreateAsync(null, userDataFolder);
+                await webView.EnsureCoreWebView2Async(environment);
+                webView.CoreWebView2.Settings.AreDevToolsEnabled = false;
+                webView.CoreWebView2.NavigationCompleted += async (_, _) =>
+                {
+                    await ExtractAsync(closeOnSuccess: true);
+                    timer.Start();
+                };
+                webView.CoreWebView2.Navigate($"https://steamdb.info/depot/{Uri.EscapeDataString(depotId)}/manifests/");
+            }
+            catch (Exception ex)
+            {
+                status.Text = $"WebView2 failed: {ex.Message}";
+            }
+        };
+
+        System.Windows.Forms.Application.Run(form);
+        return result;
+    }
+
+    private static List<LuaManifestOptionState> RowsToOptions(List<SteamDbManifestRow> rows, string currentManifestId)
+    {
+        var options = new Dictionary<string, LuaManifestOptionState>(StringComparer.OrdinalIgnoreCase);
+        foreach (var row in rows)
+        {
+            var manifestId = row.ManifestId.Trim();
+            if (!Regex.IsMatch(manifestId, @"^\d{12,20}$")) continue;
+            var isCurrent = string.Equals(manifestId, currentManifestId, StringComparison.OrdinalIgnoreCase);
+            var date = row.Date.Trim();
+            options[manifestId] = new LuaManifestOptionState
+            {
+                ManifestId = manifestId,
+                Date = date,
+                Label = string.IsNullOrWhiteSpace(date) ? $"{manifestId}{(isCurrent ? " (current)" : "")}" : $"{manifestId} - {date}{(isCurrent ? " (current)" : "")}",
+                IsCurrent = isCurrent
+            };
+        }
+
+        if (!string.IsNullOrWhiteSpace(currentManifestId) && !options.ContainsKey(currentManifestId))
+        {
+            options[currentManifestId] = new LuaManifestOptionState
+            {
+                ManifestId = currentManifestId,
+                Label = $"{currentManifestId} (current)",
+                IsCurrent = true
+            };
+        }
+
+        return options.Values.ToList();
+    }
+
+    private sealed class SteamDbManifestRow
+    {
+        public string ManifestId { get; set; } = "";
+        public string Date { get; set; } = "";
+    }
+}
+
+static class SteamDbVersionPicker
+{
+    public static List<LuaManifestOptionState> Pick(string appId, string depotId, string currentManifestId, bool visible = false)
+    {
+        var result = PickInternal(appId, depotId, currentManifestId, visible);
+        if (!visible && result.NeedsVisibleFallback)
+            result = PickInternal(appId, depotId, currentManifestId, visible: true);
+        return result.Options;
+    }
+
+    private static SteamDbPickResult PickInternal(string appId, string depotId, string currentManifestId, bool visible)
+    {
+        if (Thread.CurrentThread.GetApartmentState() == ApartmentState.STA)
+            return PickOnSta(appId, depotId, currentManifestId, visible);
+
+        SteamDbPickResult? result = null;
+        Exception? error = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                result = PickOnSta(appId, depotId, currentManifestId, visible);
+            }
+            catch (Exception ex)
+            {
+                error = ex;
+            }
+        });
+
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+
+        if (error is not null) throw error;
+        return result ?? new SteamDbPickResult([], false);
+    }
+
+    private static SteamDbPickResult PickOnSta(string appId, string depotId, string currentManifestId, bool visible)
+    {
+        var result = new List<LuaManifestOptionState>();
+        var needsVisibleFallback = false;
+        var userDataFolder = "";
+        using var form = new System.Windows.Forms.Form
+        {
+            Text = $"SteamDB Versions - App {appId}",
+            Width = 980,
+            Height = 700,
+            StartPosition = visible ? System.Windows.Forms.FormStartPosition.CenterScreen : System.Windows.Forms.FormStartPosition.Manual,
+            MinimizeBox = false,
+            MaximizeBox = true,
+            ShowInTaskbar = visible,
+            TopMost = visible,
+            Opacity = visible ? 1 : 0,
+            FormBorderStyle = visible ? System.Windows.Forms.FormBorderStyle.Sizable : System.Windows.Forms.FormBorderStyle.FixedToolWindow
+        };
+        if (!visible)
+            form.Location = new System.Drawing.Point(-32000, -32000);
+
+        var webView = new WebView2 { Dock = System.Windows.Forms.DockStyle.Fill };
+        var bottom = new System.Windows.Forms.Panel
+        {
+            Dock = System.Windows.Forms.DockStyle.Bottom,
+            Height = 44,
+            Padding = new System.Windows.Forms.Padding(8)
+        };
+        var status = new System.Windows.Forms.Label
+        {
+            AutoSize = false,
+            Dock = System.Windows.Forms.DockStyle.Fill,
+            Text = "Loading SteamDB manifests...",
+            TextAlign = System.Drawing.ContentAlignment.MiddleLeft
+        };
+        var useButton = new System.Windows.Forms.Button
+        {
+            Text = "Use loaded rows",
+            Dock = System.Windows.Forms.DockStyle.Right,
+            Width = 132,
+            Enabled = false
+        };
+        var cancelButton = new System.Windows.Forms.Button
+        {
+            Text = "Cancel",
+            Dock = System.Windows.Forms.DockStyle.Right,
+            Width = 82
+        };
+        bottom.Controls.Add(status);
+        bottom.Controls.Add(cancelButton);
+        bottom.Controls.Add(useButton);
+        form.Controls.Add(webView);
+        form.Controls.Add(bottom);
+
+        var manifestRows = new List<SteamDbManifestRow>();
+        var buildRows = new List<SteamDbBuildRow>();
+        var latest = new List<LuaManifestOptionState>();
+        var loadingBuilds = false;
+        var buildLookupComplete = false;
+        var buildPolls = 0;
+        var timer = new System.Windows.Forms.Timer { Interval = 1200 };
+        var timeout = new System.Windows.Forms.Timer { Interval = 120000 };
+
+        void RefreshLatest()
+        {
+            latest = RowsToOptions(manifestRows, buildRows, currentManifestId);
+            useButton.Enabled = latest.Count > 0 && (!loadingBuilds || buildLookupComplete);
+        }
+
+        async Task ExtractManifestsAsync()
+        {
+            if (webView.CoreWebView2 is null) return;
+            var json = await webView.CoreWebView2.ExecuteScriptAsync("""
+(() => {
+  const text = document.body?.innerText || "";
+  const rows = [];
+  const seen = new Set();
+  const datePattern = "\\d{1,2}\\s+[A-Za-z]+\\s+\\d{4}\\s+[\\u2013\\u2014-]\\s+\\d{2}:\\d{2}:\\d{2}\\s+UTC";
+  const dateRe = new RegExp(datePattern, "i");
+  const manifestRe = /\b\d{12,20}\b/g;
+  const dateFrom = value => (String(value || "").match(dateRe) || [""])[0];
+  const add = (manifestId, date) => {
+    manifestId = String(manifestId || "").trim();
+    date = String(date || "").trim();
+    if (!/^\d{12,20}$/.test(manifestId) || seen.has(manifestId)) return;
+    seen.add(manifestId);
+    rows.push({ manifestId, date });
+  };
+
+  const display = text.match(new RegExp("Displaying manifest\\s+(\\d{12,20})\\s+dated\\s+(" + datePattern + ")", "i"));
+  if (display) add(display[1], display[2]);
+
+  for (const link of document.querySelectorAll("a[href], a")) {
+    const combined = `${link.textContent || ""} ${link.getAttribute("href") || ""}`;
+    const manifestIds = combined.match(manifestRe) || [];
+    if (!manifestIds.length) continue;
+    const row = link.closest("tr") || link.closest("li") || link.parentElement;
+    let date = dateFrom(row?.innerText || "");
+    if (!date && row?.previousElementSibling) date = dateFrom(row.previousElementSibling.innerText || "");
+    for (const manifestId of manifestIds) add(manifestId, date);
+  }
+
+  const start = text.search(/Previously seen manifests/i);
+  const section = start >= 0 ? text.slice(start) : text;
+  const lines = section.split(/\n+/).map(line => line.trim()).filter(Boolean);
+  let lastDate = "";
+  for (const line of lines) {
+    const date = dateFrom(line);
+    if (date) lastDate = date;
+    const manifestIds = line.match(manifestRe) || [];
+    for (const manifestId of manifestIds) add(manifestId, lastDate);
+  }
+  return rows;
+})()
+""");
+            manifestRows = JsonSerializer.Deserialize<List<SteamDbManifestRow>>(json, JsonOptions.Default) ?? [];
+            RefreshLatest();
+        }
+
+        async Task<bool> IsChallengePageAsync()
+        {
+            if (webView.CoreWebView2 is null) return false;
+            var json = await webView.CoreWebView2.ExecuteScriptAsync("""
+(() => {
+  const text = `${document.title || ""}\n${document.body?.innerText || ""}`.toLowerCase();
+  return /captcha|cloudflare|verify you are human|checking your browser|attention required|cf-challenge|challenge-platform|ray id/.test(text);
+})()
+""");
+            return bool.TryParse(json, out var blocked) && blocked;
+        }
+
+        async Task ExtractBuildsAsync()
+        {
+            if (webView.CoreWebView2 is null) return;
+            var json = await webView.CoreWebView2.ExecuteScriptAsync("""
+(() => {
+  const text = document.body?.innerText || "";
+  const rows = [];
+  const seen = new Set();
+  const datePattern = "\\d{1,2}\\s+[A-Za-z]+\\s+\\d{4}(?:\\s+[\\u2013\\u2014-]\\s+\\d{2}:\\d{2}(?::\\d{2})?\\s+UTC|,\\s+[A-Za-z]{3},\\s+\\d{2}:\\d{2}|\\s+[A-Za-z]{3}\\s+\\d{2}:\\d{2})";
+  const dateRe = new RegExp(datePattern, "i");
+  const dateOnlyRe = /^\d{1,2}\s+[A-Za-z]+\s+\d{4}$/i;
+  const dayRe = /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$/i;
+  const timeRe = /^\d{1,2}:\d{2}$/;
+  const buildRe = /\b\d{5,12}\b/g;
+  const dateFrom = value => (String(value || "").match(dateRe) || [""])[0];
+  const add = (buildId, date) => {
+    buildId = String(buildId || "").trim();
+    date = String(date || "").trim();
+    if (!/^\d{5,12}$/.test(buildId)) return;
+    if (seen.has(buildId)) {
+      const existing = rows.find(row => row.buildId === buildId);
+      if (existing && !existing.date && date) existing.date = date;
+      return;
+    }
+    seen.add(buildId);
+    rows.push({ buildId, date });
+  };
+
+  const buildTable = Array.from(document.querySelectorAll("table")).find(table => {
+    const tableText = table.innerText || "";
+    return /Patch\s+Title/i.test(tableText) && /\bBuildID\b/i.test(tableText) && /\bDate\b/i.test(tableText);
+  });
+
+  if (buildTable) {
+    for (const tr of buildTable.querySelectorAll("tbody tr")) {
+      const cells = Array.from(tr.querySelectorAll("td")).map(td => (td.innerText || "").trim()).filter(Boolean);
+      if (cells.length < 4) continue;
+      const buildIds = cells[cells.length - 1].match(buildRe) || [];
+      const buildId = buildIds.length ? buildIds[buildIds.length - 1] : "";
+      if (!buildId) continue;
+      const date = `${cells[0] || ""} ${cells[1] || ""} ${cells[2] || ""}`.trim();
+      add(buildId, date);
+    }
+  }
+
+  let buildStart = text.search(/Date\s+Day\s+Time\s+Patch\s+Title\s+BuildID/i);
+  if (buildStart < 0) {
+    const buildsMatch = text.match(/\nBuilds\s*(?:\nRSS)?\n/i);
+    buildStart = buildsMatch ? buildsMatch.index : -1;
+  }
+  const buildSection = buildStart >= 0
+    ? text.slice(buildStart).split(/\nSteamDB|\n\s*ABOUT|\n\s*DISCOVERY|\n\s*TOOLS|\n\s*DATABASE|\nImprove our data coverage/i)[0]
+    : "";
+
+  for (const link of (buildTable || document.createElement("div")).querySelectorAll("a[href]")) {
+    const href = link.getAttribute("href") || "";
+    const match = href.match(/\/patchnotes\/(\d{5,12})\/?/i);
+    if (!match) continue;
+    const row = link.closest("tr") || link.closest("li") || link.parentElement;
+    let date = dateFrom(row?.innerText || "");
+    if (!date && row?.previousElementSibling) date = dateFrom(row.previousElementSibling.innerText || "");
+    add(match[1], date);
+  }
+
+  const lines = buildSection.split(/\n+/).map(line => line.trim()).filter(Boolean);
+  let lastDate = "";
+  for (const line of lines) {
+    const date = dateFrom(line);
+    if (date) lastDate = date;
+    const buildMatch = line.match(/\bBuild\s+(\d{5,12})\b/i) || line.match(/^(\d{5,12})$/);
+    if (buildMatch) add(buildMatch[1], lastDate);
+    if (date) {
+      const buildIds = line.match(buildRe) || [];
+      for (const buildId of buildIds) add(buildId, date);
+    }
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    if (!dateOnlyRe.test(lines[i])) continue;
+    const day = lines.slice(i + 1, i + 5).find(line => dayRe.test(line)) || "";
+    const time = lines.slice(i + 1, i + 6).find(line => timeRe.test(line)) || "";
+    if (!day || !time) continue;
+    const buildId = lines.slice(i + 1, i + 10).find(line => /^\d{5,12}$/.test(line)) || "";
+    if (buildId) add(buildId, `${lines[i]} ${day} ${time}`);
+  }
+  return rows;
+})()
+""");
+            buildRows = JsonSerializer.Deserialize<List<SteamDbBuildRow>>(json, JsonOptions.Default) ?? [];
+            buildPolls++;
+            if (buildRows.Count > 0 || buildPolls >= 10)
+                buildLookupComplete = true;
+            RefreshLatest();
+        }
+
+        async Task ExtractAsync(bool closeOnSuccess)
+        {
+            if (webView.CoreWebView2 is null) return;
+            try
+            {
+                var source = webView.CoreWebView2.Source ?? "";
+                if (!visible && await IsChallengePageAsync())
+                {
+                    needsVisibleFallback = true;
+                    timer.Stop();
+                    form.Close();
+                    return;
+                }
+
+                if (source.Contains("/patchnotes", StringComparison.OrdinalIgnoreCase))
+                {
+                    await ExtractBuildsAsync();
+                    if (buildRows.Count > 0)
+                    {
+                        status.Text = $"Loaded {manifestRows.Count} ManifestIDs and {buildRows.Count} BuildIDs.";
+                    }
+                    else if (!buildLookupComplete)
+                    {
+                        status.Text = $"Loaded {manifestRows.Count} ManifestIDs. Still waiting for BuildIDs...";
+                    }
+                    else
+                    {
+                        status.Text = $"Loaded {manifestRows.Count} ManifestIDs. BuildIDs unavailable on this SteamDB page.";
+                    }
+                    if (!visible && buildLookupComplete && manifestRows.Count > 0 && !HasMatchedBuildIds(latest))
+                    {
+                        needsVisibleFallback = true;
+                        result = latest;
+                        timer.Stop();
+                        form.Close();
+                        return;
+                    }
+                    if (closeOnSuccess && manifestRows.Count > 0 && (HasMatchedBuildIds(latest) || (!visible && buildLookupComplete)))
+                    {
+                        result = latest;
+                        timer.Stop();
+                        form.Close();
+                    }
+                    return;
+                }
+
+                await ExtractManifestsAsync();
+                if (manifestRows.Count == 0)
+                {
+                    status.Text = "No ManifestIDs found yet. Finish any browser check, then use loaded rows.";
+                    return;
+                }
+
+                status.Text = $"Found {manifestRows.Count} ManifestIDs. Loading BuildIDs...";
+                if (!loadingBuilds)
+                {
+                    loadingBuilds = true;
+                    buildLookupComplete = false;
+                    buildPolls = 0;
+                    useButton.Enabled = false;
+                    webView.CoreWebView2.Navigate($"https://steamdb.info/app/{Uri.EscapeDataString(appId)}/patchnotes/");
+                }
+            }
+            catch (Exception ex)
+            {
+        status.Text = $"Could not read page yet: {ex.Message}";
+            }
+        }
+
+        useButton.Click += async (_, _) =>
+        {
+            await ExtractAsync(closeOnSuccess: false);
+            result = latest;
+            form.Close();
+        };
+        cancelButton.Click += (_, _) =>
+        {
+            result = [];
+            form.Close();
+        };
+        timer.Tick += async (_, _) => await ExtractAsync(closeOnSuccess: true);
+        timeout.Tick += (_, _) =>
+        {
+            timeout.Stop();
+            RefreshLatest();
+            if (!visible && (latest.Count == 0 || !HasMatchedBuildIds(latest)))
+                needsVisibleFallback = true;
+            result = latest;
+            form.Close();
+        };
+        form.FormClosed += (_, _) =>
+        {
+            timer.Stop();
+            timeout.Stop();
+        };
+
+        form.Shown += async (_, _) =>
+        {
+            try
+            {
+                form.WindowState = System.Windows.Forms.FormWindowState.Normal;
+                if (visible)
+                {
+                    form.Show();
+                    form.BringToFront();
+                    form.Activate();
+                    _ = Task.Delay(2500).ContinueWith(_ =>
+                    {
+                        if (!form.IsDisposed)
+                        {
+                            try { form.BeginInvoke(() => form.TopMost = false); } catch { }
+                        }
+                    });
+                }
+                timeout.Start();
+                userDataFolder = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "HubcapLauncher",
+                    "SteamDbWebView2");
+                Directory.CreateDirectory(userDataFolder);
+                TryDeleteOldSteamDbTempProfiles();
+                var environment = await CoreWebView2Environment.CreateAsync(null, userDataFolder);
+                await webView.EnsureCoreWebView2Async(environment);
+                webView.CoreWebView2.Settings.AreDevToolsEnabled = false;
+                webView.CoreWebView2.NavigationCompleted += async (_, _) =>
+                {
+                    await ExtractAsync(closeOnSuccess: true);
+                    timer.Start();
+                };
+                webView.CoreWebView2.Navigate($"https://steamdb.info/depot/{Uri.EscapeDataString(depotId)}/manifests/");
+            }
+            catch (Exception ex)
+            {
+                status.Text = $"WebView2 failed: {ex.Message}";
+            }
+        };
+
+        System.Windows.Forms.Application.Run(form);
+        form.Dispose();
+        CleanSteamDbWebViewCache(userDataFolder);
+        return new SteamDbPickResult(result, needsVisibleFallback);
+    }
+
+    private static void TryDeleteOldSteamDbTempProfiles()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "HubcapLauncher");
+        if (!Directory.Exists(root)) return;
+        foreach (var dir in Directory.EnumerateDirectories(root, "SteamDbWebView2-*"))
+            TryDeleteDirectory(dir);
+    }
+
+    private static void CleanSteamDbWebViewCache(string userDataFolder)
+    {
+        if (string.IsNullOrWhiteSpace(userDataFolder) || !Directory.Exists(userDataFolder)) return;
+        var cacheNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "Cache",
+            "Code Cache",
+            "GPUCache",
+            "DawnGraphiteCache",
+            "DawnWebGPUCache",
+            "GrShaderCache",
+            "ShaderCache",
+            "GraphiteDawnCache",
+            "BrowserMetrics",
+            "CrashpadMetrics-active.pma",
+            "CrashpadMetrics.pma"
+        };
+
+        var cleanupTargets = Directory.EnumerateFileSystemEntries(userDataFolder, "*", SearchOption.AllDirectories)
+            .Where(path => cacheNames.Contains(Path.GetFileName(path)))
+            .OrderByDescending(path => path.Length)
+            .ToList();
+
+        foreach (var path in cleanupTargets)
+        {
+            try
+            {
+                if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+                else if (File.Exists(path)) File.Delete(path);
+            }
+            catch
+            {
+                // Cache cleanup is best-effort; keep cookies/session data intact.
+            }
+        }
+    }
+
+    private static void TryDeleteDirectory(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !Directory.Exists(path)) return;
+        for (var attempt = 0; attempt < 8; attempt++)
+        {
+            try
+            {
+                Directory.Delete(path, recursive: true);
+                return;
+            }
+            catch
+            {
+                Thread.Sleep(250);
+            }
+        }
+    }
+
+    private static List<LuaManifestOptionState> RowsToOptions(
+        List<SteamDbManifestRow> manifestRows,
+        List<SteamDbBuildRow> buildRows,
+        string currentManifestId)
+    {
+        var buildByDate = buildRows
+            .Select(row => new { Key = SteamDbTimestampKey(row.Date), row.BuildId })
+            .Where(row => !string.IsNullOrWhiteSpace(row.Key) && !string.IsNullOrWhiteSpace(row.BuildId))
+            .GroupBy(row => row.Key, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.First().BuildId.Trim(), StringComparer.OrdinalIgnoreCase);
+        var options = new Dictionary<string, LuaManifestOptionState>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var row in manifestRows)
+        {
+            var manifestId = row.ManifestId.Trim();
+            if (!Regex.IsMatch(manifestId, @"^\d{12,20}$")) continue;
+            var isCurrent = string.Equals(manifestId, currentManifestId, StringComparison.OrdinalIgnoreCase);
+            var date = row.Date.Trim();
+            buildByDate.TryGetValue(SteamDbTimestampKey(date), out var buildId);
+            var label = !string.IsNullOrWhiteSpace(buildId)
+                ? $"{buildId} - {manifestId}"
+                : manifestId;
+            var dateOnly = SteamDbDateOnlyLabel(date);
+            if (!string.IsNullOrWhiteSpace(dateOnly)) label += $" - {dateOnly}";
+            if (isCurrent) label += " (current)";
+            options[manifestId] = new LuaManifestOptionState
+            {
+                ManifestId = manifestId,
+                BuildId = buildId ?? "",
+                Date = date,
+                Label = label,
+                IsCurrent = isCurrent
+            };
+        }
+
+        if (!string.IsNullOrWhiteSpace(currentManifestId) && !options.ContainsKey(currentManifestId))
+        {
+            options[currentManifestId] = new LuaManifestOptionState
+            {
+                ManifestId = currentManifestId,
+                BuildId = "",
+                Label = $"{currentManifestId} (current)",
+                IsCurrent = true
+            };
+        }
+
+        return options.Values
+            .OrderByDescending(option => ParseSteamDbDateForPicker(option.Date))
+            .ThenByDescending(option => option.IsCurrent)
+            .ToList();
+    }
+
+    private static bool HasMatchedBuildIds(List<LuaManifestOptionState> options) =>
+        options.Any(option => Regex.IsMatch(option.Label, @"^\d{5,12}\s+-\s+\d{12,20}\b"));
+
+    private static string SteamDbTimestampKey(string value)
+    {
+        return TryParseSteamDbTimestamp(value, out var parsed)
+            ? parsed.ToUniversalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)
+            : "";
+    }
+
+    private static DateTimeOffset ParseSteamDbDateForPicker(string value)
+    {
+        return TryParseSteamDbTimestamp(value, out var parsed) ? parsed : DateTimeOffset.MinValue;
+    }
+
+    private static string SteamDbDateOnlyLabel(string value)
+    {
+        return TryParseSteamDbTimestamp(value, out var parsed)
+            ? parsed.ToUniversalTime().ToString("d MMMM yyyy", CultureInfo.InvariantCulture)
+            : "";
+    }
+
+    private static bool TryParseSteamDbTimestamp(string value, out DateTimeOffset parsed)
+    {
+        parsed = DateTimeOffset.MinValue;
+        if (string.IsNullOrWhiteSpace(value)) return false;
+
+        var normalized = Regex.Replace(value, @"\s+", " ")
+            .Replace("\u2013", "-", StringComparison.Ordinal)
+            .Replace("\u2014", "-", StringComparison.Ordinal)
+            .Trim();
+        var match = Regex.Match(
+            normalized,
+            @"(?<day>\d{1,2})\s+(?<month>[A-Za-z]+)\s+(?<year>\d{4})(?:\s*-\s*|,\s*(?:[A-Za-z]{3},\s*)?|\s+[A-Za-z]{3}\s+)(?<hour>\d{1,2}):(?<minute>\d{2})(?::(?<second>\d{2}))?",
+            RegexOptions.IgnoreCase);
+        if (!match.Success) return false;
+
+        var second = match.Groups["second"].Success ? match.Groups["second"].Value : "00";
+        var stamp = $"{match.Groups["day"].Value} {match.Groups["month"].Value} {match.Groups["year"].Value} {match.Groups["hour"].Value}:{match.Groups["minute"].Value}:{second} +00:00";
+        return DateTimeOffset.TryParseExact(
+            stamp,
+            "d MMMM yyyy H:mm:ss zzz",
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+            out parsed);
+    }
+
+    private sealed class SteamDbManifestRow
+    {
+        public string ManifestId { get; set; } = "";
+        public string Date { get; set; } = "";
+    }
+
+    private sealed class SteamDbBuildRow
+    {
+        public string BuildId { get; set; } = "";
+        public string Date { get; set; } = "";
+    }
+
+    private sealed record SteamDbPickResult(List<LuaManifestOptionState> Options, bool NeedsVisibleFallback);
+}
+
 static class WindowOwner
 {
     public static IntPtr GetBestOwner()
@@ -923,6 +1776,7 @@ sealed class HubcapLauncher
                     await SetLibraryStateAsync(cdp, new LibraryUiState
                     {
                         AppId = appId,
+                        GameName = resolved.GameName,
                         Exists = false,
                         Removed = libraryRemove.Success,
                         StatusText = libraryRemove.Success ? "" : libraryRemove.Error,
@@ -941,11 +1795,95 @@ sealed class HubcapLauncher
                         await SetLibraryStateAsync(cdp, new LibraryUiState
                         {
                             AppId = appId,
+                            GameName = resolved.GameName,
                             Exists = _hubcap.HasLua(appId, out _),
                             StatusText = libraryCheck.Error,
                             StatusTone = "error"
                         });
                     }
+                    return;
+
+                case "libraryLuaVersion":
+                    await SetLibraryStateAsync(cdp, new LibraryUiState
+                    {
+                        AppId = appId,
+                        GameName = resolved.GameName,
+                        Exists = _hubcap.HasLua(appId, out _),
+                        LuaVersion = LuaVersionState.CreateLoading(appId, resolved.GameName)
+                    });
+                    var luaVersion = await _hubcap.GetLuaVersionWithBrowserAsync(appId, resolved.GameName);
+                    luaVersion.GameName = resolved.GameName;
+                    await SetLibraryStateAsync(cdp, new LibraryUiState
+                    {
+                        AppId = appId,
+                        GameName = resolved.GameName,
+                        Exists = _hubcap.HasLua(appId, out _),
+                        LuaVersion = luaVersion
+                    });
+                    return;
+
+                case "libraryApplyLuaVersion":
+                    await SetLibraryStateAsync(cdp, new LibraryUiState
+                    {
+                        AppId = appId,
+                        GameName = resolved.GameName,
+                        Exists = _hubcap.HasLua(appId, out _),
+                        LuaVersion = LuaVersionState.CreateApplying(appId, resolved.GameName)
+                    });
+                    var applyLuaVersion = await _hubcap.ApplyLuaVersionAsync(appId, evt.ManifestId);
+                    var appliedLuaVersion = _hubcap.GetLuaVersionCurrentOnly(appId, resolved.GameName);
+                    var existingOptions = evt.Options?.Where(option => !string.IsNullOrWhiteSpace(option.ManifestId)).ToList() ?? [];
+                    if (existingOptions.Count == 0 && !string.IsNullOrWhiteSpace(evt.ManifestId))
+                    {
+                        existingOptions.Add(new LuaManifestOptionState
+                        {
+                            ManifestId = evt.ManifestId,
+                            BuildId = evt.BuildId,
+                            Date = evt.Date,
+                            Label = string.IsNullOrWhiteSpace(evt.Label) ? evt.ManifestId : evt.Label
+                        });
+                    }
+                    foreach (var option in existingOptions)
+                    {
+                        option.IsCurrent = string.Equals(option.ManifestId, appliedLuaVersion.CurrentManifestId, StringComparison.OrdinalIgnoreCase);
+                        option.Label = LuaManifestOptionLabel(option);
+                    }
+                    var currentOption = existingOptions.FirstOrDefault(option => option.IsCurrent);
+                    appliedLuaVersion.Options = existingOptions;
+                    appliedLuaVersion.SelectedManifestId = appliedLuaVersion.CurrentManifestId;
+                    appliedLuaVersion.CurrentBuildId = currentOption?.BuildId ?? appliedLuaVersion.CurrentBuildId;
+                    appliedLuaVersion.CurrentDate = currentOption?.Date ?? appliedLuaVersion.CurrentDate;
+                    appliedLuaVersion.StatusText = applyLuaVersion.Success ? "Lua manifest updated." : applyLuaVersion.Error;
+                    appliedLuaVersion.StatusTone = applyLuaVersion.Success ? "success" : "error";
+                    await SetLibraryStateAsync(cdp, new LibraryUiState
+                    {
+                        AppId = appId,
+                        GameName = resolved.GameName,
+                        Exists = _hubcap.HasLua(appId, out _),
+                        LuaVersion = appliedLuaVersion
+                    });
+                    return;
+
+                case "libraryLoadLuaVersions":
+                    await SetLibraryStateAsync(cdp, new LibraryUiState
+                    {
+                        AppId = appId,
+                        GameName = resolved.GameName,
+                        Exists = _hubcap.HasLua(appId, out _),
+                        LuaVersion = LuaVersionState.CreateBrowserLoading(appId, resolved.GameName)
+                    });
+                    var browserLuaVersion = await _hubcap.GetLuaVersionWithBrowserAsync(appId, resolved.GameName);
+                    await SetLibraryStateAsync(cdp, new LibraryUiState
+                    {
+                        AppId = appId,
+                        GameName = resolved.GameName,
+                        Exists = _hubcap.HasLua(appId, out _),
+                        LuaVersion = browserLuaVersion
+                    });
+                    return;
+
+                case "openSteamDb":
+                    _hubcap.OpenSteamDb(evt.Url);
                     return;
 
                 case "library":
@@ -1022,6 +1960,7 @@ sealed class HubcapLauncher
         await SetLibraryStateAsync(cdp, new LibraryUiState
         {
             AppId = resolved.AppId,
+            GameName = resolved.GameName,
             Exists = exists,
             StatusText = error ?? ""
         });
@@ -1039,9 +1978,21 @@ sealed class HubcapLauncher
         await cdp.EvaluateAsync($"window.__hubcapLibrarySetState && window.__hubcapLibrarySetState({json})");
     }
 
+    private static string LuaManifestOptionLabel(LuaManifestOptionState option)
+    {
+        var label = Regex.Replace(option.Label ?? "", @"\s+\(current\)$", "", RegexOptions.IgnoreCase).Trim();
+        if (string.IsNullOrWhiteSpace(label))
+        {
+            label = !string.IsNullOrWhiteSpace(option.BuildId)
+                ? $"{option.BuildId} - {option.ManifestId}"
+                : option.ManifestId;
+        }
+        return option.IsCurrent ? $"{label} (current)" : label;
+    }
+
     private async Task<ResolvedApp> ResolveSteamAppAsync(string visibleAppId)
     {
-        if (string.IsNullOrWhiteSpace(visibleAppId)) return new ResolvedApp("", "", "", false);
+        if (string.IsNullOrWhiteSpace(visibleAppId)) return new ResolvedApp("", "", "", "", false);
         return await _resolvedApps.GetOrAdd(visibleAppId, ResolveSteamAppUncachedAsync);
     }
 
@@ -1052,20 +2003,24 @@ sealed class HubcapLauncher
             var json = await _http.GetStringAsync($"https://store.steampowered.com/api/appdetails?appids={Uri.EscapeDataString(visibleAppId)}&filters=basic");
             var root = JsonNode.Parse(json);
             var data = root?[visibleAppId]?["data"];
+            var appName = data?["name"]?.GetValue<string>() ?? "";
             var isDlc = string.Equals(data?["type"]?.GetValue<string>(), "dlc", StringComparison.OrdinalIgnoreCase);
             var fullGame = data?["fullgame"];
             var parentId = AppIdNodeToString(fullGame?["appid"]);
             if (isDlc && !string.IsNullOrWhiteSpace(parentId))
             {
-                return new ResolvedApp(parentId, visibleAppId, fullGame?["name"]?.GetValue<string>() ?? "", true);
+                var parentName = fullGame?["name"]?.GetValue<string>() ?? "";
+                return new ResolvedApp(parentId, visibleAppId, string.IsNullOrWhiteSpace(parentName) ? appName : parentName, parentName, true);
             }
+
+            return new ResolvedApp(visibleAppId, visibleAppId, appName, "", false);
         }
         catch (Exception ex)
         {
             Logger.Info($"Could not resolve appdetails for {visibleAppId}: {ex.Message}");
         }
 
-        return new ResolvedApp(visibleAppId, visibleAppId, "", false);
+        return new ResolvedApp(visibleAppId, visibleAppId, "", "", false);
     }
 
     private static string AppIdNodeToString(JsonNode? node)
@@ -1365,6 +2320,176 @@ sealed class HubcapService
         }
     }
 
+    public async Task<LuaVersionState> GetLuaVersionAsync(string appId, string gameName = "")
+    {
+        try
+        {
+            var config = EnsureLuaCache();
+            var luaPath = Path.Combine(config.LuaDir, $"{appId}.lua");
+            if (!File.Exists(luaPath))
+                return LuaVersionState.Error(appId, "", "", "Lua file no longer exists.", gameName);
+
+            var entries = ReadLuaManifestEntries(luaPath);
+            var depotId = MainDepotId(appId);
+            var current = SelectLuaVersionEntry(entries, appId);
+            if (current is null)
+                return LuaVersionState.Error(appId, depotId, "", "No active Windows base depot manifest found in this Lua.", gameName);
+
+            depotId = current.DepotId;
+            var state = LuaVersionState.ForCurrent(appId, depotId, current.ManifestId, gameName);
+            try
+            {
+                state.Options = await GetSteamDbManifestOptionsAsync(depotId, current.ManifestId);
+                var currentOption = state.Options.FirstOrDefault(option => string.Equals(option.ManifestId, current.ManifestId, StringComparison.OrdinalIgnoreCase));
+                if (currentOption is not null) state.CurrentDate = currentOption.Date;
+                state.StatusText = state.Options.Count > 1
+                    ? ""
+                    : "SteamDB did not return older manifests for this depot.";
+            }
+            catch (Exception ex)
+            {
+                state.Options = [new LuaManifestOptionState
+                {
+                    ManifestId = current.ManifestId,
+                    Date = "",
+                    Label = $"{current.ManifestId} (current)",
+                    IsCurrent = true
+                }];
+                state.StatusText = $"SteamDB manifest list unavailable: {ex.Message}";
+                state.StatusTone = "error";
+            }
+
+            return state;
+        }
+        catch (Exception ex)
+        {
+            return LuaVersionState.Error(appId, MainDepotId(appId), "", ex.Message, gameName);
+        }
+    }
+
+    public LuaVersionState GetLuaVersionCurrentOnly(string appId, string gameName = "")
+    {
+        try
+        {
+            var config = EnsureLuaCache();
+            var luaPath = Path.Combine(config.LuaDir, $"{appId}.lua");
+            if (!File.Exists(luaPath))
+                return LuaVersionState.Error(appId, "", "", "Lua file no longer exists.", gameName);
+
+            var entries = ReadLuaManifestEntries(luaPath);
+            var depotId = MainDepotId(appId);
+            var current = SelectLuaVersionEntry(entries, appId);
+            if (current is null)
+                return LuaVersionState.Error(appId, depotId, "", "No active Windows base depot manifest found in this Lua.", gameName);
+
+            return LuaVersionState.ForCurrent(appId, current.DepotId, current.ManifestId, gameName);
+        }
+        catch (Exception ex)
+        {
+            return LuaVersionState.Error(appId, MainDepotId(appId), "", ex.Message, gameName);
+        }
+    }
+
+    public async Task<LuaVersionState> GetLuaVersionWithBrowserAsync(string appId, string gameName = "")
+    {
+        var state = await GetLuaVersionAsync(appId, gameName);
+        if (string.IsNullOrWhiteSpace(state.DepotId) || string.IsNullOrWhiteSpace(state.CurrentManifestId))
+        {
+            state.StatusText = string.IsNullOrWhiteSpace(state.StatusText) ? "No current Lua manifest to match against." : state.StatusText;
+            state.StatusTone = "error";
+            return state;
+        }
+
+        try
+        {
+            var options = SteamDbVersionPicker.Pick(state.AppId, state.DepotId, state.CurrentManifestId);
+            if (options.Count == 0)
+            {
+                state.StatusText = "No manifest rows were readable from the SteamDB window.";
+                state.StatusTone = "error";
+                return state;
+            }
+
+            state.Options = options;
+            state.SelectedManifestId = state.CurrentManifestId;
+            var current = options.FirstOrDefault(option => string.Equals(option.ManifestId, state.CurrentManifestId, StringComparison.OrdinalIgnoreCase));
+            state.CurrentDate = current?.Date ?? state.CurrentDate;
+            state.CurrentBuildId = current?.BuildId ?? state.CurrentBuildId;
+            var hasBuildIds = options.Any(option => Regex.IsMatch(option.Label, @"^\d{5,12}\s+-\s+\d{12,20}\b"));
+            state.StatusText = hasBuildIds
+                ? $"Loaded {options.Count} versions from SteamDB."
+                : $"Loaded {options.Count} ManifestIDs. BuildIDs were not available on SteamDB for this app.";
+            state.StatusTone = "success";
+            return state;
+        }
+        catch (Exception ex)
+        {
+            state.StatusText = $"SteamDB browser picker failed: {ex.Message}";
+            state.StatusTone = "error";
+            return state;
+        }
+    }
+
+    public async Task<ActionResult> ApplyLuaVersionAsync(string appId, string manifestId)
+    {
+        try
+        {
+            manifestId = (manifestId ?? "").Trim();
+            if (!Regex.IsMatch(manifestId, @"^\d{12,20}$"))
+                return new ActionResult(false, "Select a valid ManifestID first.");
+
+            var config = EnsureLuaCache();
+            var luaPath = Path.Combine(config.LuaDir, $"{appId}.lua");
+            if (!File.Exists(luaPath))
+                return new ActionResult(false, "Lua file no longer exists.");
+
+            var entries = ReadLuaManifestEntries(luaPath);
+            var target = SelectLuaVersionEntry(entries, appId);
+            if (target is null)
+                return new ActionResult(false, "No active Windows base depot manifest found in this Lua.");
+            if (string.Equals(target.ManifestId, manifestId, StringComparison.OrdinalIgnoreCase))
+                return new ActionResult(false, "That ManifestID is already selected.");
+
+            var text = await File.ReadAllTextAsync(luaPath);
+            var depotPattern = Regex.Escape(target.DepotId);
+            var pattern = $"""(?m)^(\s*setManifestid\s*\(\s*{depotPattern}\s*,\s*["'])(\d+)(["'])""";
+            var replaced = Regex.Replace(
+                text,
+                pattern,
+                match => $"{match.Groups[1].Value}{manifestId}{match.Groups[3].Value}",
+                RegexOptions.IgnoreCase,
+                TimeSpan.FromSeconds(2));
+            if (string.Equals(text, replaced, StringComparison.Ordinal))
+                return new ActionResult(false, $"Could not update depot {target.DepotId} in the Lua.");
+
+            await File.WriteAllTextAsync(luaPath, replaced);
+            MarkLua(appId, exists: true);
+            return new ActionResult(true, "");
+        }
+        catch (Exception ex)
+        {
+            return new ActionResult(false, ex.Message);
+        }
+    }
+
+    public ActionResult OpenSteamDb(string url)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(url) ||
+                !Uri.TryCreate(url, UriKind.Absolute, out var uri) ||
+                !string.Equals(uri.Host, "steamdb.info", StringComparison.OrdinalIgnoreCase))
+                return new ActionResult(false, "Invalid SteamDB URL.");
+
+            Process.Start(new ProcessStartInfo(uri.ToString()) { UseShellExecute = true });
+            return new ActionResult(true, "");
+        }
+        catch (Exception ex)
+        {
+            return new ActionResult(false, ex.Message);
+        }
+    }
+
     public SettingsState GetSettings()
     {
         try
@@ -1504,6 +2629,170 @@ sealed class HubcapService
             if (File.Exists(marker)) File.Delete(marker);
         }
     }
+
+    private async Task<List<LuaManifestOptionState>> GetSteamDbManifestOptionsAsync(string depotId, string currentManifestId)
+    {
+        var url = $"https://steamdb.info/depot/{Uri.EscapeDataString(depotId)}/manifests/";
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36");
+        request.Headers.Accept.ParseAdd("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+        request.Headers.Referrer = new Uri("https://steamdb.info/");
+        using var response = await _http.SendAsync(request);
+        if (!response.IsSuccessStatusCode)
+            throw new InvalidOperationException($"SteamDB returned {(int)response.StatusCode}.");
+
+        var html = await response.Content.ReadAsStringAsync();
+        var options = ParseSteamDbManifestOptions(html, currentManifestId);
+        if (options.Count == 0)
+            throw new InvalidOperationException("no manifests found on SteamDB.");
+        return options;
+    }
+
+    private static List<LuaManifestEntry> ReadLuaManifestEntries(string luaPath)
+    {
+        var entries = new List<LuaManifestEntry>();
+        var depotMeta = new Dictionary<string, LuaDepotMeta>(StringComparer.OrdinalIgnoreCase);
+        var section = LuaDepotSection.Unknown;
+
+        foreach (var line in File.ReadLines(luaPath))
+        {
+            var trimmed = line.TrimStart();
+            if (trimmed.StartsWith("--", StringComparison.Ordinal))
+            {
+                section = NextLuaDepotSection(section, trimmed);
+                continue;
+            }
+
+            var addMatch = Regex.Match(line, @"^\s*addappid\s*\(\s*(?<depot>\d+)[^)]*\)\s*(?:--\s*(?<comment>.*))?$", RegexOptions.IgnoreCase);
+            if (addMatch.Success)
+            {
+                var depotId = addMatch.Groups["depot"].Value;
+                var comment = addMatch.Groups["comment"].Value.Trim();
+                depotMeta[depotId] = LuaDepotMeta.From(section, comment);
+                continue;
+            }
+
+            var manifestMatch = Regex.Match(line, @"^\s*setManifestid\s*\(\s*(?<depot>\d+)\s*,\s*[""'](?<manifest>\d+)[""']\s*(?:,\s*(?<size>\d+))?\s*\)", RegexOptions.IgnoreCase);
+            if (!manifestMatch.Success) continue;
+
+            var manifestDepotId = manifestMatch.Groups["depot"].Value;
+            if (!depotMeta.TryGetValue(manifestDepotId, out var meta))
+                meta = LuaDepotMeta.From(section, "");
+            entries.Add(new LuaManifestEntry
+            {
+                DepotId = manifestDepotId,
+                ManifestId = manifestMatch.Groups["manifest"].Value,
+                Size = manifestMatch.Groups["size"].Value,
+                Comment = meta.Comment,
+                Section = meta.Section,
+                IsWindows = meta.IsWindows,
+                IsNonWindows = meta.IsNonWindows,
+                IsBase = meta.IsBase,
+                IsDlc = meta.IsDlc,
+                IsShared = meta.IsShared
+            });
+        }
+
+        return entries;
+    }
+
+    private static LuaManifestEntry? SelectLuaVersionEntry(List<LuaManifestEntry> entries, string appId)
+    {
+        var active = entries
+            .Where(entry => !entry.IsShared && !entry.IsDlc && !entry.IsNonWindows)
+            .ToList();
+        var mainDepotId = MainDepotId(appId);
+
+        var explicitWindowsBase = active
+            .Where(entry => entry.IsBase && entry.IsWindows)
+            .ToList();
+        var current = explicitWindowsBase.FirstOrDefault(entry => string.Equals(entry.DepotId, mainDepotId, StringComparison.OrdinalIgnoreCase))
+            ?? explicitWindowsBase.FirstOrDefault();
+        if (current is not null) return current;
+
+        var inferredBase = active.Where(entry => entry.IsBase).ToList();
+        current = inferredBase.FirstOrDefault(entry => string.Equals(entry.DepotId, mainDepotId, StringComparison.OrdinalIgnoreCase));
+        if (current is not null) return current;
+        if (inferredBase.Count == 1) return inferredBase[0];
+
+        current = active.FirstOrDefault(entry => string.Equals(entry.DepotId, mainDepotId, StringComparison.OrdinalIgnoreCase));
+        if (current is not null) return current;
+        return active.Count == 1 ? active[0] : null;
+    }
+
+    private static LuaDepotSection NextLuaDepotSection(LuaDepotSection current, string commentLine)
+    {
+        var text = commentLine.TrimStart('-').Trim();
+        if (text.Contains("MAIN APP DEPOTS", StringComparison.OrdinalIgnoreCase)) return LuaDepotSection.Base;
+        if (text.Contains("DLCS WITH DEDICATED DEPOTS", StringComparison.OrdinalIgnoreCase)) return LuaDepotSection.Dlc;
+        if (text.Contains("SHARED DEPOTS", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("REDISTRIBUTABLES", StringComparison.OrdinalIgnoreCase)) return LuaDepotSection.Shared;
+        if (text.Contains("EMPTY DEPOTS", StringComparison.OrdinalIgnoreCase)) return LuaDepotSection.Empty;
+        if (text.Contains("MAIN APPLICATION", StringComparison.OrdinalIgnoreCase)) return LuaDepotSection.MainApplication;
+        return current;
+    }
+
+    private static List<LuaManifestOptionState> ParseSteamDbManifestOptions(string html, string currentManifestId)
+    {
+        var text = WebUtility.HtmlDecode(Regex.Replace(html, "<[^>]+>", "\n"));
+        text = Regex.Replace(text, @"[ \t\r\f\v]+", " ");
+        text = Regex.Replace(text, @"\n\s+", "\n");
+
+        var options = new Dictionary<string, LuaManifestOptionState>(StringComparer.OrdinalIgnoreCase);
+        var displayMatch = Regex.Match(
+            text,
+            @"Displaying manifest\s+(?<manifest>\d{12,20})\s+dated\s+(?<date>\d{1,2}\s+[A-Za-z]+\s+\d{4}\s+\p{Pd}\s+\d{2}:\d{2}:\d{2}\s+UTC)",
+            RegexOptions.IgnoreCase);
+        if (displayMatch.Success)
+            AddSteamDbOption(options, displayMatch.Groups["manifest"].Value, displayMatch.Groups["date"].Value, currentManifestId);
+
+        var sectionStart = text.IndexOf("Previously seen manifests", StringComparison.OrdinalIgnoreCase);
+        if (sectionStart >= 0)
+        {
+            var section = text[sectionStart..];
+            var historyStart = section.IndexOf("\n##", StringComparison.OrdinalIgnoreCase);
+            if (historyStart > 0) section = section[..historyStart];
+
+            foreach (Match match in Regex.Matches(
+                section,
+                @"(?<date>\d{1,2}\s+[A-Za-z]+\s+\d{4}\s+\p{Pd}\s+\d{2}:\d{2}:\d{2}\s+UTC)\s+(?<manifest>\d{12,20})",
+                RegexOptions.IgnoreCase))
+            {
+                AddSteamDbOption(options, match.Groups["manifest"].Value, match.Groups["date"].Value, currentManifestId);
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(currentManifestId) && !options.ContainsKey(currentManifestId))
+            AddSteamDbOption(options, currentManifestId, "", currentManifestId);
+
+        return options.Values
+            .OrderByDescending(option => ParseSteamDbDate(option.Date))
+            .ThenByDescending(option => option.IsCurrent)
+            .ToList();
+    }
+
+    private static void AddSteamDbOption(Dictionary<string, LuaManifestOptionState> options, string manifestId, string date, string currentManifestId)
+    {
+        if (string.IsNullOrWhiteSpace(manifestId)) return;
+        var isCurrent = string.Equals(manifestId, currentManifestId, StringComparison.OrdinalIgnoreCase);
+        options[manifestId] = new LuaManifestOptionState
+        {
+            ManifestId = manifestId,
+            Date = date,
+            Label = string.IsNullOrWhiteSpace(date) ? $"{manifestId}{(isCurrent ? " (current)" : "")}" : $"{manifestId} - {date}{(isCurrent ? " (current)" : "")}",
+            IsCurrent = isCurrent
+        };
+    }
+
+    private static DateTimeOffset ParseSteamDbDate(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return DateTimeOffset.MinValue;
+        var normalized = value.Replace("–", "-", StringComparison.Ordinal).Replace("—", "-", StringComparison.Ordinal);
+        return DateTimeOffset.TryParse(normalized, out var parsed) ? parsed : DateTimeOffset.MinValue;
+    }
+
+    private static string MainDepotId(string appId) =>
+        long.TryParse(appId, out var numeric) ? (numeric + 1).ToString() : "";
 
     private HubcapConfig EnsureLuaCache()
     {
@@ -1874,13 +3163,73 @@ sealed class CdpSession : IDisposable
 }
 
 sealed record CdpTarget(string Id, string Title, string Type, string Url, string WebSocketDebuggerUrl);
-sealed record ResolvedApp(string AppId, string VisibleAppId, string ParentName, bool IsDlc);
+sealed record ResolvedApp(string AppId, string VisibleAppId, string GameName, string ParentName, bool IsDlc);
 sealed record HubcapConfig(string ApiKey, string LuaDir);
 sealed record StatusResult(bool Success, bool Available, string Error);
 sealed record CachedStatusResult(StatusResult Result, DateTimeOffset ExpiresAt);
 sealed record ActionResult(bool Success, string Error);
-sealed record HubcapEvent(string Action, string AppId, string Href, string LuaDir = "", string ApiKey = "");
+sealed record HubcapEvent(
+    string Action,
+    string AppId,
+    string Href,
+    string LuaDir = "",
+    string ApiKey = "",
+    string ManifestId = "",
+    string BuildId = "",
+    string Date = "",
+    string Label = "",
+    string Url = "",
+    List<LuaManifestOptionState>? Options = null);
 sealed record StoreWatchdogState(string AppId, bool HasUi, bool HasSetter);
+
+enum LuaDepotSection
+{
+    Unknown,
+    MainApplication,
+    Base,
+    Dlc,
+    Shared,
+    Empty
+}
+
+sealed class LuaDepotMeta
+{
+    public LuaDepotSection Section { get; private init; }
+    public string Comment { get; private init; } = "";
+    public bool IsWindows { get; private init; }
+    public bool IsNonWindows { get; private init; }
+    public bool IsBase => Section == LuaDepotSection.Base;
+    public bool IsDlc => Section == LuaDepotSection.Dlc;
+    public bool IsShared => Section == LuaDepotSection.Shared || Comment.Contains("Shared from", StringComparison.OrdinalIgnoreCase);
+
+    public static LuaDepotMeta From(LuaDepotSection section, string comment)
+    {
+        var normalized = comment ?? "";
+        var isWindows = Regex.IsMatch(normalized, @"\b(win|win32|win64|windows)\b", RegexOptions.IgnoreCase);
+        var isNonWindows = Regex.IsMatch(normalized, @"\b(linux|osx|macos|mac)\b", RegexOptions.IgnoreCase);
+        return new LuaDepotMeta
+        {
+            Section = section,
+            Comment = normalized,
+            IsWindows = isWindows,
+            IsNonWindows = isNonWindows
+        };
+    }
+}
+
+sealed class LuaManifestEntry
+{
+    public string DepotId { get; init; } = "";
+    public string ManifestId { get; init; } = "";
+    public string Size { get; init; } = "";
+    public string Comment { get; init; } = "";
+    public LuaDepotSection Section { get; init; }
+    public bool IsWindows { get; init; }
+    public bool IsNonWindows { get; init; }
+    public bool IsBase { get; init; }
+    public bool IsDlc { get; init; }
+    public bool IsShared { get; init; }
+}
 
 sealed class UiState
 {
@@ -1917,10 +3266,94 @@ sealed class SettingsState
 sealed class LibraryUiState
 {
     public string AppId { get; set; } = "";
+    public string GameName { get; set; } = "";
     public bool Exists { get; set; }
     public bool Removed { get; set; }
     public string StatusText { get; set; } = "";
     public string StatusTone { get; set; } = "idle";
+    public LuaVersionState? LuaVersion { get; set; }
+}
+
+sealed class LuaVersionState
+{
+    public bool Visible { get; set; }
+    public bool Loading { get; set; }
+    public bool Applying { get; set; }
+    public string AppId { get; set; } = "";
+    public string GameName { get; set; } = "";
+    public string DepotId { get; set; } = "";
+    public string CurrentManifestId { get; set; } = "";
+    public string CurrentBuildId { get; set; } = "";
+    public string CurrentDate { get; set; } = "";
+    public string SelectedManifestId { get; set; } = "";
+    public string BuildUrl { get; set; } = "";
+    public string ManifestUrl { get; set; } = "";
+    public string StatusText { get; set; } = "";
+    public string StatusTone { get; set; } = "idle";
+    public List<LuaManifestOptionState> Options { get; set; } = [];
+
+    public static LuaVersionState CreateLoading(string appId, string gameName = "") => new()
+    {
+        Visible = true,
+        Loading = true,
+        AppId = appId,
+        GameName = gameName
+    };
+
+    public static LuaVersionState CreateBrowserLoading(string appId, string gameName = "") => new()
+    {
+        Visible = true,
+        Loading = true,
+        AppId = appId,
+        GameName = gameName,
+        StatusText = "Loading versions from SteamDB...",
+        StatusTone = "idle"
+    };
+
+    public static LuaVersionState CreateApplying(string appId, string gameName = "") => new()
+    {
+        Visible = true,
+        Applying = true,
+        AppId = appId,
+        GameName = gameName,
+        StatusText = "Applying...",
+        StatusTone = "idle"
+    };
+
+    public static LuaVersionState ForCurrent(string appId, string depotId, string manifestId, string gameName = "") => new()
+    {
+        Visible = true,
+        AppId = appId,
+        GameName = gameName,
+        DepotId = depotId,
+        CurrentManifestId = manifestId,
+        SelectedManifestId = manifestId,
+        BuildUrl = $"https://steamdb.info/app/{appId}/patchnotes/",
+        ManifestUrl = $"https://steamdb.info/depot/{depotId}/manifests/"
+    };
+
+    public static LuaVersionState Error(string appId, string depotId, string manifestId, string error, string gameName = "") => new()
+    {
+        Visible = true,
+        AppId = appId,
+        GameName = gameName,
+        DepotId = depotId,
+        CurrentManifestId = manifestId,
+        SelectedManifestId = manifestId,
+        BuildUrl = $"https://steamdb.info/app/{appId}/patchnotes/",
+        ManifestUrl = string.IsNullOrWhiteSpace(depotId) ? "" : $"https://steamdb.info/depot/{depotId}/manifests/",
+        StatusText = error,
+        StatusTone = "error"
+    };
+}
+
+sealed class LuaManifestOptionState
+{
+    public string ManifestId { get; set; } = "";
+    public string BuildId { get; set; } = "";
+    public string Date { get; set; } = "";
+    public string Label { get; set; } = "";
+    public bool IsCurrent { get; set; }
 }
 
 sealed class UsageState
@@ -1985,6 +3418,7 @@ static class Scripts
     public const string StoreUi = """
 (() => {
   const ROOT_ID = "hubcap-cdp-ui";
+  const CONFIRM_ID = "hubcap-cdp-remove-confirm";
   const STYLE_ID = "hubcap-cdp-ui-style";
   const USAGE_CACHE_KEY = "hubcap-cdp-usage-cache";
   document.getElementById(STYLE_ID)?.remove();
@@ -2045,6 +3479,16 @@ static class Scripts
     #${ROOT_ID} .hp-save-settings{background:rgba(13,27,39,.48);border:1px solid rgba(103,193,245,.26);border-radius:3px;color:#d6f4ff;cursor:pointer;display:none;font:12px Arial,Helvetica,sans-serif;height:28px;min-height:28px;min-width:64px;padding:0 12px}
     #${ROOT_ID} .hp-save-settings[data-visible="true"]{display:inline-flex}
     #${ROOT_ID} .hp-save-settings:hover{background:rgba(26,52,70,.62);border-color:rgba(103,193,245,.42);color:#fff}
+    #${CONFIRM_ID}{align-items:center;background:rgba(0,0,0,.58);bottom:0;box-sizing:border-box;display:flex;font-family:Arial,Helvetica,sans-serif;justify-content:center;left:0;padding:18px;position:fixed;right:0;top:0;z-index:9999999}
+    #${CONFIRM_ID} .hp-confirm-box{background:linear-gradient(135deg,rgba(22,40,55,.98),rgba(16,31,43,.98));border:1px solid rgba(103,193,245,.3);border-radius:4px;box-shadow:0 18px 48px rgba(0,0,0,.55);box-sizing:border-box;color:#dfe3e6;max-width:360px;padding:16px;width:min(360px,calc(100vw - 36px))}
+    #${CONFIRM_ID} .hp-confirm-title{color:#fff;font-size:16px;font-weight:700;line-height:20px;margin-bottom:8px}
+    #${CONFIRM_ID} .hp-confirm-message{color:#b8c6d1;font-size:13px;line-height:18px;margin-bottom:14px;overflow-wrap:anywhere}
+    #${CONFIRM_ID} .hp-confirm-actions{align-items:center;display:flex;gap:10px;justify-content:flex-end}
+    #${CONFIRM_ID} button{align-items:center;border-radius:3px;box-sizing:border-box;cursor:pointer;display:inline-flex;font:700 13px/1 Arial,Helvetica,sans-serif;height:32px;justify-content:center;min-width:72px;padding:0 14px;text-align:center}
+    #${CONFIRM_ID} .hp-confirm-no{background:rgba(13,27,39,.68);border:1px solid rgba(103,193,245,.32);color:#d6f4ff}
+    #${CONFIRM_ID} .hp-confirm-no:hover{background:rgba(26,52,70,.78);color:#fff}
+    #${CONFIRM_ID} .hp-confirm-yes{background:rgba(95,33,31,.78);border:1px solid rgba(217,75,63,.48);color:#ffe0dc}
+    #${CONFIRM_ID} .hp-confirm-yes:hover{background:rgba(112,42,39,.88);color:#fff1ef}
     @keyframes hubcap-cdp-spin{to{transform:rotate(360deg)}}
   `;
   document.head.appendChild(style);
@@ -2081,6 +3525,20 @@ static class Scripts
     if (typeof window.hubcapNative === "function") window.hubcapNative(payload);
     else console.warn("[Hubcap CDP] native binding unavailable", payload);
   };
+  function showRemoveConfirm(onConfirm) {
+    document.getElementById(CONFIRM_ID)?.remove();
+    const modal = document.createElement("div");
+    modal.id = CONFIRM_ID;
+    modal.innerHTML = `<div class="hp-confirm-box"><div class="hp-confirm-title">Remove Lua?</div><div class="hp-confirm-message"></div><div class="hp-confirm-actions"><button class="hp-confirm-no" type="button">No</button><button class="hp-confirm-yes" type="button">Yes</button></div></div>`;
+    const gameName = document.querySelector(".apphub_AppName")?.textContent?.trim() || `app ${appIdFromUrl()}`;
+    modal.querySelector(".hp-confirm-message").textContent = `Remove Lua for ${gameName}? This will delete the local Lua file.`;
+    const close = () => modal.remove();
+    modal.querySelector(".hp-confirm-no").addEventListener("click", event => { event.preventDefault(); event.stopPropagation(); close(); });
+    modal.querySelector(".hp-confirm-yes").addEventListener("click", event => { event.preventDefault(); event.stopPropagation(); close(); onConfirm(); });
+    modal.addEventListener("click", event => { if (event.target === modal) close(); });
+    document.body.appendChild(modal);
+    modal.querySelector(".hp-confirm-no").focus();
+  }
   function setSettingsNote(message, tone = "idle") {
     const note = root.querySelector(".hp-settings-note");
     if (!note) return;
@@ -2153,7 +3611,7 @@ static class Scripts
     }catch{}
   }
   if (!root.dataset.bound) {
-    root.querySelector(".hp-main").addEventListener("click",()=>{const state=root.querySelector(".hp-main").dataset.state;if(state==="download")send("download");if(state==="remove")send("remove");});
+    root.querySelector(".hp-main").addEventListener("click",()=>{const state=root.querySelector(".hp-main").dataset.state;if(state==="download")send("download");if(state==="remove")showRemoveConfirm(()=>send("remove"));});
     root.querySelector(".hp-library").addEventListener("click",()=>send("library"));
     root.querySelector(".hp-usage").addEventListener("click",()=>send("refresh"));
     root.querySelector(".hp-settings-button").addEventListener("click",event=>{event.preventDefault();event.stopPropagation();setSettingsNote("Loading...");root.querySelector(".hp-settings").dataset.visible="true";send("settings");});
@@ -2182,6 +3640,9 @@ static class Scripts
 (() => {
   const BUTTON_ID = "hubcap-cdp-library-remove";
   const CHECK_BUTTON_ID = "hubcap-cdp-library-check";
+  const VERSION_BUTTON_ID = "hubcap-cdp-library-version";
+  const VERSION_PANEL_ID = "hubcap-cdp-library-version-panel";
+  const CONFIRM_ID = "hubcap-cdp-library-remove-confirm";
   const STATUS_ID = "hubcap-cdp-library-status";
   const STYLE_ID = "hubcap-cdp-library-style";
 
@@ -2198,8 +3659,8 @@ static class Scripts
     return pathname.match(/^\/(?:routes\/)?library\/app\/(\d+)(?:\/|$)/)?.[1] || "";
   }
 
-  function send(action, appId) {
-    const payload = JSON.stringify({ action, appId: appId || routeAppId(), href: globalThis.MainWindowBrowserManager?.m_lastLocation?.pathname || location.href });
+  function send(action, appId, extra = {}) {
+    const payload = JSON.stringify({ action, appId: appId || routeAppId(), href: globalThis.MainWindowBrowserManager?.m_lastLocation?.pathname || location.href, ...extra });
     if (typeof globalThis.hubcapNative === "function") globalThis.hubcapNative(payload);
     else console.warn("[Hubcap CDP Shared Library] native binding unavailable", payload);
   }
@@ -2211,6 +3672,9 @@ static class Scripts
       #${CHECK_BUTTON_ID}{align-items:center;align-self:center;appearance:none;background:rgba(13,27,39,.48);border:1px solid rgba(103,193,245,.26);border-radius:3px;box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 1px 2px rgba(0,0,0,.24);box-sizing:border-box;color:#d6f4ff;cursor:pointer;display:inline-flex;font:14px Arial,Helvetica,sans-serif;height:32px;justify-content:center;line-height:1;margin:0 8px 0 0;min-height:32px;min-width:104px;padding:0 14px;text-align:center;transform:translateY(3px);vertical-align:middle;white-space:nowrap}
       #${CHECK_BUTTON_ID}:hover{background:rgba(26,52,70,.62);border-color:rgba(103,193,245,.42);color:#fff}
       #${CHECK_BUTTON_ID}:disabled{cursor:default;opacity:.72}
+      #${VERSION_BUTTON_ID}{align-items:center;align-self:center;appearance:none;background:rgba(13,27,39,.48);border:1px solid rgba(103,193,245,.26);border-radius:3px;box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 1px 2px rgba(0,0,0,.24);box-sizing:border-box;color:#d6f4ff;cursor:pointer;display:inline-flex;font:14px Arial,Helvetica,sans-serif;height:32px;justify-content:center;line-height:1;margin:0 8px 0 0;min-height:32px;min-width:104px;padding:0 14px;text-align:center;transform:translateY(3px);vertical-align:middle;white-space:nowrap}
+      #${VERSION_BUTTON_ID}:hover{background:rgba(26,52,70,.62);border-color:rgba(103,193,245,.42);color:#fff}
+      #${VERSION_BUTTON_ID}:disabled{cursor:default;opacity:.72}
       #${BUTTON_ID}{align-items:center;align-self:center;appearance:none;background:rgba(95,33,31,.58);border:1px solid rgba(217,75,63,.36);border-radius:3px;box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 1px 2px rgba(0,0,0,.24);box-sizing:border-box;color:#ffe0dc;cursor:pointer;display:inline-flex;font:14px Arial,Helvetica,sans-serif;height:32px;justify-content:center;line-height:1;margin:0 8px 0 0;min-height:32px;min-width:104px;padding:0 14px;text-align:center;transform:translateY(3px);vertical-align:middle;white-space:nowrap}
       #${BUTTON_ID}:hover{background:rgba(112,42,39,.72);border-color:rgba(217,75,63,.5);color:#fff1ef}
       #${BUTTON_ID}:disabled{cursor:default;opacity:.72}
@@ -2218,14 +3682,75 @@ static class Scripts
       #${STATUS_ID}{align-items:center;align-self:center;color:#ff9b8f;display:inline-flex;font:700 14px/32px Arial,Helvetica,sans-serif;height:32px;justify-content:center;margin-right:8px;min-width:104px;padding:0 14px;text-shadow:0 1px 2px rgba(0,0,0,.55);transform:translateY(3px);white-space:nowrap}
       #${STATUS_ID}[data-tone="success"]{color:#8bc53f}
       #${STATUS_ID}[data-tone="error"]{color:#ff9b8f}
+      #${VERSION_PANEL_ID}{background:linear-gradient(135deg,rgba(22,40,55,.98),rgba(16,31,43,.98));border:1px solid rgba(103,193,245,.22);border-radius:4px;box-shadow:0 16px 42px rgba(0,0,0,.45);box-sizing:border-box;color:#dfe3e6;font:13px Arial,Helvetica,sans-serif;left:50%;max-width:460px;padding:14px;position:fixed;top:96px;transform:translateX(-50%);width:min(460px,calc(100vw - 32px));z-index:999999}
+      #${VERSION_PANEL_ID} .hpv-head{align-items:center;display:flex;gap:12px;justify-content:space-between;margin-bottom:12px}
+      #${VERSION_PANEL_ID} .hpv-title{color:#fff;font-size:16px;font-weight:700;line-height:20px}
+      #${VERSION_PANEL_ID} .hpv-close{appearance:none;background:transparent;border:0;color:#b8c6d1;cursor:pointer;font-size:20px;height:24px;line-height:20px;padding:0;width:24px}
+      #${VERSION_PANEL_ID} .hpv-close:hover{color:#fff}
+      #${VERSION_PANEL_ID} .hpv-note{color:#b8c6d1;font-size:12px;line-height:17px;margin:-4px 0 10px}
+      #${VERSION_PANEL_ID} .hpv-label{color:#8fb8cd;font-size:11px;font-weight:700;letter-spacing:.04em;margin:10px 0 4px;text-transform:uppercase}
+      #${VERSION_PANEL_ID} .hpv-value{color:#fff;font-size:13px;font-weight:700;line-height:18px;overflow-wrap:anywhere}
+      #${VERSION_PANEL_ID} select{appearance:auto;background:#182b3a;border:1px solid rgba(103,193,245,.34);border-radius:3px;box-sizing:border-box;color:#fff;font:13px Arial,Helvetica,sans-serif;min-height:32px;padding:6px;width:100%}
+      #${VERSION_PANEL_ID} select:disabled{opacity:.68}
+      #${VERSION_PANEL_ID} .hpv-actions{align-items:center;display:flex;gap:10px;justify-content:flex-end;margin-top:12px}
+      #${VERSION_PANEL_ID} .hpv-apply{align-items:center;appearance:none;background:linear-gradient(90deg,#75a313,#8abf19);border:0;border-radius:3px;color:#fff;cursor:pointer;display:inline-flex;font:700 13px/1 Arial,Helvetica,sans-serif;height:32px;justify-content:center;min-width:70px;padding:0 16px;text-align:center}
+      #${VERSION_PANEL_ID} .hpv-apply:hover{filter:brightness(1.08)}
+      #${VERSION_PANEL_ID} .hpv-apply:disabled{cursor:default;filter:none;opacity:.62}
+      #${VERSION_PANEL_ID} .hpv-status{color:#b8c6d1;font-size:12px;line-height:17px;margin-top:10px;overflow-wrap:anywhere}
+      #${VERSION_PANEL_ID} .hpv-status[data-tone="success"]{color:#8bc53f}
+      #${VERSION_PANEL_ID} .hpv-status[data-tone="error"]{color:#ff9b8f}
+      #${CONFIRM_ID}{align-items:center;background:rgba(0,0,0,.58);bottom:0;box-sizing:border-box;display:flex;font-family:Arial,Helvetica,sans-serif;justify-content:center;left:0;padding:18px;position:fixed;right:0;top:0;z-index:1000000}
+      #${CONFIRM_ID} .hpc-box{background:linear-gradient(135deg,rgba(22,40,55,.98),rgba(16,31,43,.98));border:1px solid rgba(103,193,245,.3);border-radius:4px;box-shadow:0 18px 48px rgba(0,0,0,.55);box-sizing:border-box;color:#dfe3e6;max-width:360px;padding:16px;width:min(360px,calc(100vw - 36px))}
+      #${CONFIRM_ID} .hpc-title{color:#fff;font-size:16px;font-weight:700;line-height:20px;margin-bottom:8px}
+      #${CONFIRM_ID} .hpc-message{color:#b8c6d1;font-size:13px;line-height:18px;margin-bottom:14px;overflow-wrap:anywhere}
+      #${CONFIRM_ID} .hpc-actions{align-items:center;display:flex;gap:10px;justify-content:flex-end}
+      #${CONFIRM_ID} button{align-items:center;border-radius:3px;box-sizing:border-box;cursor:pointer;display:inline-flex;font:700 13px/1 Arial,Helvetica,sans-serif;height:32px;justify-content:center;min-width:72px;padding:0 14px;text-align:center}
+      #${CONFIRM_ID} .hpc-no{background:rgba(13,27,39,.68);border:1px solid rgba(103,193,245,.32);color:#d6f4ff}
+      #${CONFIRM_ID} .hpc-no:hover{background:rgba(26,52,70,.78);color:#fff}
+      #${CONFIRM_ID} .hpc-yes{background:rgba(95,33,31,.78);border:1px solid rgba(217,75,63,.48);color:#ffe0dc}
+      #${CONFIRM_ID} .hpc-yes:hover{background:rgba(112,42,39,.88);color:#fff1ef}
       @keyframes hubcap-library-fade-out{0%,45%{opacity:1}100%{opacity:0}}
     `;
     if (!style.parentElement) doc.head.appendChild(style);
   }
 
-  function removeElements(doc) {
+  function removeElements(doc, keepVersionPanel = false) {
     if (!doc) return;
-    doc.querySelectorAll(`#${CHECK_BUTTON_ID},#${BUTTON_ID},#${STATUS_ID}`).forEach(el => el.remove());
+    const selector = keepVersionPanel
+      ? `#${VERSION_BUTTON_ID},#${CHECK_BUTTON_ID},#${BUTTON_ID},#${STATUS_ID},#${CONFIRM_ID}`
+      : `#${VERSION_BUTTON_ID},#${CHECK_BUTTON_ID},#${BUTTON_ID},#${STATUS_ID},#${VERSION_PANEL_ID},#${CONFIRM_ID}`;
+    doc.querySelectorAll(selector).forEach(el => el.remove());
+  }
+
+  function showRemoveConfirm(doc, state, onConfirm) {
+    doc.getElementById(CONFIRM_ID)?.remove();
+    const modal = doc.createElement("div");
+    modal.id = CONFIRM_ID;
+    modal.innerHTML = `<div class="hpc-box"><div class="hpc-title">Remove Lua?</div><div class="hpc-message"></div><div class="hpc-actions"><button class="hpc-no" type="button">No</button><button class="hpc-yes" type="button">Yes</button></div></div>`;
+    const appId = state.appId || routeAppId();
+    const gameName = state.gameName || `app ${appId}`;
+    modal.querySelector(".hpc-message").textContent = `Remove Lua for ${gameName}? This will delete the local Lua file.`;
+    const close = () => modal.remove();
+    modal.querySelector(".hpc-no").addEventListener("click", event => { event.preventDefault(); event.stopPropagation(); close(); });
+    modal.querySelector(".hpc-yes").addEventListener("click", event => { event.preventDefault(); event.stopPropagation(); close(); onConfirm(); });
+    modal.addEventListener("click", event => { if (event.target === modal) close(); });
+    doc.body.appendChild(modal);
+    modal.querySelector(".hpc-no").focus();
+  }
+
+  function currentVersionPanelAppId() {
+    const win = desktopWindow();
+    return win?.document?.getElementById(VERSION_PANEL_ID)?.dataset?.appId
+      || globalThis.document?.getElementById(VERSION_PANEL_ID)?.dataset?.appId
+      || "";
+  }
+
+  function shouldKeepVersionPanel(state) {
+    if (state?.luaVersion?.visible) return true;
+    if (state?.removed) return false;
+    const panelAppId = currentVersionPanelAppId();
+    const stateAppId = state?.appId || routeAppId();
+    return !!panelAppId && !!stateAppId && panelAppId === stateAppId;
   }
 
   function actionAnchorElement(doc) {
@@ -2262,7 +3787,7 @@ static class Scripts
     element.style.marginRight = "8px";
     const anchorX = anchor.getBoundingClientRect().x;
     const before = Array.from(row.children)
-      .filter(child => child.id !== CHECK_BUTTON_ID && child.id !== BUTTON_ID && child.id !== STATUS_ID)
+      .filter(child => child.id !== VERSION_BUTTON_ID && child.id !== CHECK_BUTTON_ID && child.id !== BUTTON_ID && child.id !== STATUS_ID)
       .filter(child => Math.abs(child.getBoundingClientRect().y - anchor.getBoundingClientRect().y) < 16)
       .filter(child => child.getBoundingClientRect().x >= anchorX - 8)
       .sort((a, b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x)[0] || anchor;
@@ -2270,19 +3795,147 @@ static class Scripts
     return true;
   }
 
+  function showLuaVersionPanel(doc, state) {
+    if (!state?.luaVersion?.visible) return;
+
+    const version = state.luaVersion;
+    const panel = doc.getElementById(VERSION_PANEL_ID) || doc.createElement("div");
+    panel.id = VERSION_PANEL_ID;
+    panel.dataset.appId = state.appId || routeAppId();
+
+    const close = () => panel.remove();
+    const gameName = version.gameName || state.gameName || panel.dataset.appId || "Unknown";
+    const currentText = version.currentManifestId
+      ? `${version.currentBuildId || "Unknown"} - ${version.currentManifestId}`
+      : (version.loading ? "Loading..." : "Unknown");
+
+    panel.innerHTML = `
+      <div class="hpv-head">
+        <div class="hpv-title">Lua Version</div>
+        <button class="hpv-close" type="button" title="Close">x</button>
+      </div>
+      <div class="hpv-note">This changes the version for pinned games.</div>
+      <div class="hpv-label">Game</div>
+      <div class="hpv-value hpv-game"></div>
+      <div class="hpv-label">Current Build ID - Manifest ID in LUA</div>
+      <div class="hpv-value hpv-current"></div>
+      <div class="hpv-label">Change to</div>
+      <select class="hpv-select"></select>
+      <div class="hpv-actions">
+        <button class="hpv-apply" type="button">Apply</button>
+      </div>
+      <div class="hpv-status"></div>
+    `;
+
+    panel.querySelector(".hpv-close").addEventListener("click", close);
+    panel.querySelector(".hpv-game").textContent = gameName;
+    panel.querySelector(".hpv-current").textContent = currentText;
+
+    const select = panel.querySelector(".hpv-select");
+    const options = Array.isArray(version.options) ? version.options : [];
+    if (version.loading || version.applying) {
+      const option = doc.createElement("option");
+      option.textContent = version.applying ? "Applying..." : "Loading manifests...";
+      option.value = "";
+      select.appendChild(option);
+      select.disabled = true;
+    } else if (options.length) {
+      for (const item of options) {
+        const option = doc.createElement("option");
+        option.value = item.manifestId || "";
+        option.dataset.buildId = item.buildId || "";
+        option.dataset.date = item.date || "";
+        option.dataset.label = item.label || item.manifestId || "";
+        option.textContent = item.label || item.manifestId || "";
+        option.selected = (item.manifestId || "") === (version.selectedManifestId || version.currentManifestId || "");
+        select.appendChild(option);
+      }
+    } else {
+      const option = doc.createElement("option");
+      option.textContent = "No manifests available";
+      option.value = "";
+      select.appendChild(option);
+      select.disabled = true;
+    }
+
+    const apply = panel.querySelector(".hpv-apply");
+    const selectedManifest = () => {
+      return select.value || "";
+    };
+    const refreshApply = () => {
+      const selected = selectedManifest();
+      const changed = /^\d{12,20}$/.test(selected) && selected !== (version.currentManifestId || "");
+      apply.style.display = changed ? "inline-flex" : "none";
+      apply.disabled = !changed || version.loading || version.applying;
+    };
+    select.addEventListener("change", refreshApply);
+    apply.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      const selected = selectedManifest();
+      if (!selected) return;
+      const selectedOption = select.selectedOptions?.[0];
+      apply.disabled = true;
+      apply.textContent = "Applying...";
+      send("libraryApplyLuaVersion", panel.dataset.appId, {
+        manifestId: selected,
+        buildId: selectedOption?.dataset?.buildId || "",
+        date: selectedOption?.dataset?.date || "",
+        label: selectedOption?.dataset?.label || selectedOption?.textContent || selected,
+        options: options.map(item => ({
+          manifestId: item.manifestId || "",
+          buildId: item.buildId || "",
+          date: item.date || "",
+          label: item.label || item.manifestId || "",
+          isCurrent: (item.manifestId || "") === selected
+        }))
+      });
+    });
+    refreshApply();
+
+    const status = panel.querySelector(".hpv-status");
+    status.textContent = version.statusText || "";
+    status.dataset.tone = version.statusTone || "idle";
+
+    if (!panel.parentElement) doc.body.appendChild(panel);
+  }
+
   globalThis.__hubcapLibrarySetState = state => {
-    removeElements(globalThis.document);
+    const keepVersionPanel = shouldKeepVersionPanel(state);
+    removeElements(globalThis.document, keepVersionPanel);
     const win = desktopWindow();
     const doc = win?.document;
     if (!doc) return;
 
     ensureStyle(doc);
-    removeElements(doc);
+    removeElements(doc, keepVersionPanel);
 
     if (!state.exists && !state.removed && !state.statusText) return;
     globalThis.__hubcapLastLibraryState = state.removed ? null : state;
 
     if (state.exists) {
+      const versionButton = doc.createElement("button");
+      versionButton.id = VERSION_BUTTON_ID;
+      versionButton.type = "button";
+      versionButton.dataset.appId = state.appId || routeAppId();
+      versionButton.textContent = "Lua Version";
+      versionButton.title = `Change Lua manifest for app ${versionButton.dataset.appId}`;
+      versionButton.addEventListener("click", event => {
+        event.preventDefault();
+        event.stopPropagation();
+        versionButton.disabled = true;
+        versionButton.textContent = "Loading...";
+        showLuaVersionPanel(doc, { ...state, luaVersion: { visible: true, loading: true, appId: versionButton.dataset.appId, gameName: state.gameName || "" } });
+        send("libraryLoadLuaVersions", versionButton.dataset.appId);
+        setTimeout(() => {
+          if (versionButton.isConnected) {
+            versionButton.disabled = false;
+            versionButton.textContent = "Lua Version";
+          }
+        }, 1800);
+      });
+      placeInActionBar(doc, versionButton);
+
       const checkButton = doc.createElement("button");
       checkButton.id = CHECK_BUTTON_ID;
       checkButton.type = "button";
@@ -2313,11 +3966,14 @@ static class Scripts
       button.addEventListener("click", event => {
         event.preventDefault();
         event.stopPropagation();
-        button.disabled = true;
-        button.textContent = "Removing...";
-        send("libraryRemove", button.dataset.appId);
+        showRemoveConfirm(doc, state, () => {
+          button.disabled = true;
+          button.textContent = "Removing...";
+          send("libraryRemove", button.dataset.appId);
+        });
       });
       placeInActionBar(doc, button);
+      showLuaVersionPanel(doc, state);
       return;
     }
 
@@ -2365,7 +4021,7 @@ static class Scripts
     if (!appId) return;
     const win = desktopWindow();
     if (win?.document) {
-      const current = win.document.getElementById(CHECK_BUTTON_ID) || win.document.getElementById(BUTTON_ID) || win.document.getElementById(STATUS_ID);
+      const current = win.document.getElementById(VERSION_BUTTON_ID) || win.document.getElementById(CHECK_BUTTON_ID) || win.document.getElementById(BUTTON_ID) || win.document.getElementById(STATUS_ID);
       if (current && current.dataset.appId !== appId) removeElements(win.document);
       if (!current && globalThis.__hubcapLastLibraryState?.appId === appId && !globalThis.__hubcapLastLibraryState?.removed) {
         globalThis.__hubcapLibrarySetState(globalThis.__hubcapLastLibraryState);

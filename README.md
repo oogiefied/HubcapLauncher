@@ -116,7 +116,7 @@ cd HubcapLauncher
 The published single-file executable is created at:
 
 ```text
-HubcapLauncher\bin\Release\net9.0\win-x64\publish\HubcapLauncher.exe
+HubcapLauncher\bin\Release\net9.0-windows10.0.17763.0\win-x64\publish\HubcapLauncher.exe
 ```
 
 ## Disclaimer
