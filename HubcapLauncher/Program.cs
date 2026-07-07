@@ -1,10 +1,15 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Drawing.Text;
 using System.Globalization;
 using System.IO.Compression;
 using System.Net;
 using System.Net.WebSockets;
 using System.Runtime.InteropServices;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -22,23 +27,55 @@ Logger.Configure(options);
 
 try
 {
+    if (options.LoadingTest)
+    {
+        LoadingScreen.RunPreview();
+        return;
+    }
+
     var needsSingleInstance = options.Mode == LauncherMode.Run;
     using var singleInstance = new Mutex(initiallyOwned: true, "Global\\HubcapLauncher", out var ownsInstance);
     if (needsSingleInstance && !ownsInstance && !options.AllowMultiple)
     {
-        UserPrompts.NotifyPatchAlreadyRunning();
-        Logger.Info("Steam with Hubcap patch is already running.");
-        return;
+        if (await SteamLauncher.IsDevToolsReachableAsync(http, DevToolsPort))
+        {
+            Logger.Info("Steam DevTools already available. Restarting HubcapLauncher.");
+            LauncherProcess.StopOtherLauncherInstances();
+            try
+            {
+                ownsInstance = singleInstance.WaitOne(TimeSpan.FromSeconds(6));
+            }
+            catch (AbandonedMutexException)
+            {
+                ownsInstance = true;
+            }
+        }
+
+        if (!ownsInstance)
+        {
+            UserPrompts.NotifyPatchAlreadyRunning();
+            Logger.Info("Steam with Hubcap patch is already running.");
+            return;
+        }
     }
 
+    using var loading = LoadingScreen.StartFor(options);
     Logger.Info("HubcapLauncher");
 
+    var devToolsAlreadyOpen = await SteamLauncher.IsDevToolsReachableAsync(http, DevToolsPort);
+    loading?.SetStatus(options.NoSteamLaunch
+        ? "Connecting to Steam DevTools..."
+        : devToolsAlreadyOpen
+            ? "Connecting to Steam DevTools..."
+            : "Starting Steam in dev mode...");
     if (!options.NoSteamLaunch)
         await SteamLauncher.EnsureDevModeSteamAsync(http, DevToolsPort, options.RestartSteam);
+    loading?.SetStatus("Waiting for Steam web UI...");
     await SteamLauncher.WaitForDevToolsAsync(http, DevToolsPort);
 
     if (options.Mode == LauncherMode.ListTargets)
     {
+        loading?.Close();
         var targetsJson = await http.GetStringAsync($"http://127.0.0.1:{DevToolsPort}/json/list");
         var targets = JsonSerializer.Deserialize<List<CdpTarget>>(targetsJson, JsonOptions.Default) ?? [];
         foreach (var target in targets)
@@ -48,6 +85,7 @@ try
 
     if (options.Mode == LauncherMode.ProbeTargets)
     {
+        loading?.Close();
         var targetsJson = await http.GetStringAsync($"http://127.0.0.1:{DevToolsPort}/json/list");
         var targets = JsonSerializer.Deserialize<List<CdpTarget>>(targetsJson, JsonOptions.Default) ?? [];
         foreach (var target in targets.Where(t => t.Type == "page" && !string.IsNullOrWhiteSpace(t.WebSocketDebuggerUrl)))
@@ -75,6 +113,7 @@ try
 
     if (options.Mode == LauncherMode.CheckUi)
     {
+        loading?.Close();
         var targetsJson = await http.GetStringAsync($"http://127.0.0.1:{DevToolsPort}/json/list");
         var targets = JsonSerializer.Deserialize<List<CdpTarget>>(targetsJson, JsonOptions.Default) ?? [];
         foreach (var target in targets.Where(t => t.Type == "page" && !string.IsNullOrWhiteSpace(t.WebSocketDebuggerUrl)))
@@ -116,7 +155,24 @@ JSON.stringify({
     }
 
     var launcher = new HubcapLauncher(http, DevToolsPort);
-    await launcher.RunAsync();
+    loading?.SetStatus("Finding Store and Library targets...");
+    var launcherTask = launcher.RunAsync();
+    if (loading is not null)
+    {
+        var readyTimeout = Task.Delay(TimeSpan.FromSeconds(45));
+        var readyTask = await Task.WhenAny(launcher.Ready, launcherTask, readyTimeout);
+        if (readyTask == launcher.Ready)
+        {
+            loading.SetStatus("Hubcap controls ready...");
+            await Task.Delay(450);
+        }
+        else if (readyTask == readyTimeout)
+        {
+            Logger.Info("Loading screen timed out waiting for Steam UI attach; keeping launcher running.");
+        }
+        loading.Close();
+    }
+    await launcherTask;
 }
 catch (Exception ex)
 {
@@ -138,6 +194,7 @@ sealed class LauncherOptions
     public bool NoSteamLaunch { get; init; }
     public bool Quiet { get; init; }
     public bool AllowMultiple { get; init; }
+    public bool LoadingTest { get; init; }
     public string LogPath { get; init; } = "";
     public LauncherMode Mode { get; init; } = LauncherMode.Run;
 
@@ -154,6 +211,7 @@ sealed class LauncherOptions
             NoSteamLaunch = Has(args, "--no-steam-launch"),
             Quiet = Has(args, "--quiet"),
             AllowMultiple = Has(args, "--allow-multiple"),
+            LoadingTest = Has(args, "--loading-test"),
             LogPath = ValueAfter(args, "--log") ?? "",
             Mode = mode
         };
@@ -230,6 +288,928 @@ static class ConsoleHost
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool AttachConsole(uint dwProcessId);
+}
+
+static class LauncherProcess
+{
+    public static void StopOtherLauncherInstances()
+    {
+        var currentId = Environment.ProcessId;
+        var currentPath = Environment.ProcessPath;
+        foreach (var process in Process.GetProcessesByName("HubcapLauncher"))
+        {
+            if (process.Id == currentId) continue;
+
+            try
+            {
+                var processPath = GetProcessPath(process);
+                if (!string.IsNullOrWhiteSpace(currentPath) &&
+                    (string.IsNullOrWhiteSpace(processPath) ||
+                     !string.Equals(processPath, currentPath, StringComparison.OrdinalIgnoreCase)))
+                {
+                    continue;
+                }
+
+                Logger.Info($"Stopping existing HubcapLauncher instance: {process.Id}");
+                process.Kill(entireProcessTree: true);
+                process.WaitForExit(3000);
+            }
+            catch (Exception ex)
+            {
+                Logger.Info($"Could not stop HubcapLauncher instance {process.Id}: {ex.Message}");
+            }
+        }
+    }
+
+    private static string GetProcessPath(Process process)
+    {
+        try
+        {
+            return process.MainModule?.FileName ?? "";
+        }
+        catch
+        {
+            return "";
+        }
+    }
+}
+
+sealed class LoadingScreen : IDisposable
+{
+    private readonly ManualResetEventSlim _ready = new();
+    private readonly Thread _thread;
+    private System.Windows.Forms.Timer? _dotsTimer;
+    private LoadingForm? _form;
+    private bool _closed;
+
+    private LoadingScreen(string initialStatus)
+    {
+        _thread = new Thread(() =>
+        {
+            try
+            {
+                LoadingScreen.ConfigureHighDpi();
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(true);
+
+                var form = new LoadingForm(initialStatus);
+                _form = form;
+                _dotsTimer = new System.Windows.Forms.Timer { Interval = 450 };
+                _dotsTimer.Tick += (_, _) => form.AdvanceStatusDots();
+                form.FormClosed += (_, _) =>
+                {
+                    _dotsTimer?.Dispose();
+                    _dotsTimer = null;
+                };
+                _dotsTimer.Start();
+                _ready.Set();
+                Application.Run(form);
+            }
+            catch (Exception ex)
+            {
+                Logger.Info($"Loading screen unavailable: {ex.Message}");
+                _ready.Set();
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "HubcapLauncherLoadingScreen"
+        };
+        _thread.SetApartmentState(ApartmentState.STA);
+        _thread.Start();
+    }
+
+    public static LoadingScreen? StartFor(LauncherOptions options)
+    {
+        if (options.Mode != LauncherMode.Run) return null;
+        return new LoadingScreen("Preparing HubcapLauncher...");
+    }
+
+    public static void RunPreview()
+    {
+        ConfigureHighDpi();
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(true);
+        var form = new LoadingForm("Starting Steam in dev mode...", allowClose: true);
+        var messages = new[]
+        {
+            "Starting Steam in dev mode...",
+            "Enabling Chromium DevTools...",
+            "Waiting for Steam web UI...",
+            "Checking Library context...",
+            "Convincing Steam to behave...",
+            "Asking Gabe nicely...",
+            "Finding Store and Library targets...",
+            "Injecting Hubcap controls...",
+            "Polishing the Lua button...",
+            "Steam is ready. Adding Hubcap controls..."
+        };
+        var index = 0;
+        var messageTimer = new System.Windows.Forms.Timer { Interval = 3000 };
+        messageTimer.Tick += (_, _) =>
+        {
+            index = (index + 1) % messages.Length;
+            form.SetStatus(messages[index]);
+        };
+        var dotsTimer = new System.Windows.Forms.Timer { Interval = 450 };
+        dotsTimer.Tick += (_, _) => form.AdvanceStatusDots();
+        form.FormClosed += (_, _) =>
+        {
+            messageTimer.Dispose();
+            dotsTimer.Dispose();
+        };
+        messageTimer.Start();
+        dotsTimer.Start();
+        Application.Run(form);
+    }
+
+    public static void ConfigureHighDpi()
+    {
+        try
+        {
+            Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
+        }
+        catch { }
+    }
+
+    public void SetStatus(string status)
+    {
+        if (_closed || !_ready.Wait(TimeSpan.FromSeconds(3))) return;
+
+        var form = _form;
+        if (form is null || form.IsDisposed) return;
+
+        try
+        {
+            form.BeginInvoke(new Action(() => form.SetStatus(status)));
+        }
+        catch { }
+    }
+
+    public void Close()
+    {
+        if (_closed) return;
+        _closed = true;
+
+        if (!_ready.Wait(TimeSpan.FromSeconds(3))) return;
+
+        var form = _form;
+        if (form is null || form.IsDisposed) return;
+
+        try
+        {
+            form.BeginInvoke(new Action(form.Close));
+        }
+        catch { }
+    }
+
+    public void Dispose()
+    {
+        Close();
+        _ready.Dispose();
+    }
+}
+
+static class LoaderFonts
+{
+    private static readonly List<IntPtr> EmbeddedFontMemory = [];
+    private static readonly PrivateFontCollection? EmbeddedFonts = LoadEmbeddedFonts();
+    private static readonly FontFamily? EmbeddedRegularFamily = FindEmbeddedFamily("IBM Plex Sans");
+    private static readonly string FallbackFamilyName = ResolveFallbackFamilyName();
+
+    public static Font Regular(float size) => Create(EmbeddedRegularFamily, size, FontStyle.Regular);
+
+    public static Font Bold(float size) => Create(EmbeddedRegularFamily, size, FontStyle.Bold);
+
+    private static Font Create(FontFamily? embeddedFamily, float size, FontStyle style)
+    {
+        if (embeddedFamily is not null)
+        {
+            try
+            {
+                return new Font(embeddedFamily, size, style, GraphicsUnit.Point);
+            }
+            catch
+            {
+                return new Font(embeddedFamily, size, FontStyle.Regular, GraphicsUnit.Point);
+            }
+        }
+
+        return new Font(FallbackFamilyName, size, style, GraphicsUnit.Point);
+    }
+
+    private static FontFamily? FindEmbeddedFamily(string familyName) =>
+        EmbeddedFonts?.Families.FirstOrDefault(family => string.Equals(family.Name, familyName, StringComparison.OrdinalIgnoreCase));
+
+    private static PrivateFontCollection? LoadEmbeddedFonts()
+    {
+        try
+        {
+            var assembly = Assembly.GetExecutingAssembly();
+            var resourceNames = assembly
+                .GetManifestResourceNames()
+                .Where(name => name.EndsWith(".IBMPlexSans-Regular-loader.ttf", StringComparison.OrdinalIgnoreCase) ||
+                               name.EndsWith(".IBMPlexSans-Bold-loader.ttf", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (resourceNames.Count == 0) return null;
+
+            var fonts = new PrivateFontCollection();
+            foreach (var resourceName in resourceNames)
+            {
+                using var stream = assembly.GetManifestResourceStream(resourceName);
+                if (stream is null) continue;
+
+                using var buffer = new MemoryStream();
+                stream.CopyTo(buffer);
+                var bytes = buffer.ToArray();
+                var pointer = Marshal.AllocHGlobal(bytes.Length);
+                Marshal.Copy(bytes, 0, pointer, bytes.Length);
+                EmbeddedFontMemory.Add(pointer);
+                fonts.AddMemoryFont(pointer, bytes.Length);
+            }
+
+            return fonts;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string ResolveFallbackFamilyName()
+    {
+        try
+        {
+            using var fonts = new InstalledFontCollection();
+            var names = fonts.Families.Select(family => family.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            if (names.Contains("IBM Plex Sans")) return "IBM Plex Sans";
+            if (names.Contains("Inter")) return "Inter";
+            if (names.Contains("Motiva Sans")) return "Motiva Sans";
+            if (names.Contains("Motiva Sans Regular")) return "Motiva Sans Regular";
+            if (names.Contains("Arial")) return "Arial";
+        }
+        catch { }
+
+        return "Segoe UI";
+    }
+}
+
+static class AppVersion
+{
+    public static string Current { get; } = Resolve();
+
+    private static string Resolve()
+    {
+        var assembly = Assembly.GetExecutingAssembly();
+        var informational = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        var version = string.IsNullOrWhiteSpace(informational)
+            ? assembly.GetName().Version?.ToString()
+            : informational;
+
+        if (string.IsNullOrWhiteSpace(version))
+            return "1.0.0";
+
+        var metadataIndex = version.IndexOf('+', StringComparison.Ordinal);
+        return metadataIndex > 0 ? version[..metadataIndex] : version;
+    }
+}
+
+sealed class LoadingForm : Form
+{
+    private readonly Icon? _windowIcon;
+    private readonly Label _titleLabel;
+    private readonly Label _subtitleLabel;
+    private readonly Label _statusLabel;
+    private readonly Label _versionLabel;
+    private readonly LogoSpinnerControl _spinner;
+    private readonly Panel _topBorder;
+    private readonly Panel _bottomBorder;
+    private readonly Panel _leftBorder;
+    private readonly Panel _rightBorder;
+    private readonly bool _allowClose;
+    private bool _closeHovered;
+    private bool _closePressed;
+    private Rectangle _closeRect;
+    private string _statusBaseText = "";
+    private int _statusDotCount = 1;
+
+    public LoadingForm(string initialStatus, bool allowClose = false)
+    {
+        _allowClose = allowClose;
+        Text = "HubcapLauncher";
+        StartPosition = FormStartPosition.CenterScreen;
+        FormBorderStyle = FormBorderStyle.None;
+        MaximizeBox = false;
+        MinimizeBox = false;
+        ControlBox = false;
+        ShowInTaskbar = true;
+        TopMost = true;
+        Opacity = 1.0;
+        AutoScaleMode = AutoScaleMode.None;
+        BackColor = Color.FromArgb(18, 31, 42);
+        ForeColor = Color.White;
+        Font = LoaderFonts.Regular(9F);
+        Padding = Padding.Empty;
+        _windowIcon = LoaderImages.LoadIcon();
+        if (_windowIcon is not null)
+            Icon = _windowIcon;
+
+        _spinner = new LogoSpinnerControl
+        {
+            Anchor = AnchorStyles.Top,
+            Size = new Size(86, 86)
+        };
+
+        _titleLabel = new Label
+        {
+            AutoSize = false,
+            Text = "HubcapLauncher",
+            TextAlign = ContentAlignment.MiddleCenter,
+            Font = LoaderFonts.Bold(18F),
+            BackColor = Color.Transparent,
+            ForeColor = Color.White,
+            UseCompatibleTextRendering = true
+        };
+
+        _subtitleLabel = new Label
+        {
+            AutoSize = false,
+            Text = "Getting Steam ready for Hubcap controls.",
+            TextAlign = ContentAlignment.MiddleCenter,
+            Font = LoaderFonts.Regular(10F),
+            BackColor = Color.Transparent,
+            ForeColor = Color.FromArgb(184, 198, 209),
+            UseCompatibleTextRendering = true
+        };
+
+        var initial = SplitStatusDots(initialStatus);
+        _statusBaseText = initial.BaseText;
+        _statusDotCount = initial.DotCount;
+
+        _statusLabel = new Label
+        {
+            AutoSize = false,
+            Text = FormatStatusText(),
+            TextAlign = ContentAlignment.MiddleCenter,
+            Font = LoaderFonts.Regular(9.5F),
+            BackColor = Color.Transparent,
+            ForeColor = Color.FromArgb(103, 193, 245),
+            UseCompatibleTextRendering = true
+        };
+
+        _versionLabel = new Label
+        {
+            AutoSize = false,
+            Text = $"V{AppVersion.Current}",
+            TextAlign = ContentAlignment.MiddleCenter,
+            Font = LoaderFonts.Regular(10F),
+            BackColor = Color.Transparent,
+            ForeColor = Color.FromArgb(81, 92, 101),
+            UseCompatibleTextRendering = true
+        };
+
+        _topBorder = CreateBorderStrip();
+        _bottomBorder = CreateBorderStrip();
+        _leftBorder = CreateBorderStrip();
+        _rightBorder = CreateBorderStrip();
+
+        Controls.Add(_spinner);
+        Controls.Add(_titleLabel);
+        Controls.Add(_subtitleLabel);
+        Controls.Add(_statusLabel);
+        Controls.Add(_versionLabel);
+        Controls.Add(_topBorder);
+        Controls.Add(_bottomBorder);
+        Controls.Add(_leftBorder);
+        Controls.Add(_rightBorder);
+        EnableDragMove(_spinner);
+        EnableDragMove(_titleLabel);
+        EnableDragMove(_subtitleLabel);
+        EnableDragMove(_statusLabel);
+        EnableDragMove(_versionLabel);
+        EnableDragMove(_topBorder);
+        EnableDragMove(_bottomBorder);
+        EnableDragMove(_leftBorder);
+        EnableDragMove(_rightBorder);
+
+        ApplyDpiLayout();
+    }
+
+    public void SetStatus(string status)
+    {
+        var parsed = SplitStatusDots(status);
+        _statusBaseText = parsed.BaseText;
+        _statusDotCount = parsed.DotCount;
+        _statusLabel.Text = FormatStatusText();
+    }
+
+    public void AdvanceStatusDots()
+    {
+        _statusDotCount = (_statusDotCount % 3) + 1;
+        _statusLabel.Text = FormatStatusText();
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        if (e.Button != MouseButtons.Left) return;
+
+        if (_allowClose && _closeRect.Contains(e.Location))
+        {
+            _closePressed = true;
+            Invalidate(_closeRect);
+            return;
+        }
+
+        DragMove();
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+        var hovered = _allowClose && _closeRect.Contains(e.Location);
+        if (hovered == _closeHovered) return;
+
+        _closeHovered = hovered;
+        Cursor = hovered ? Cursors.Hand : Cursors.Default;
+        Invalidate(_closeRect);
+    }
+
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        base.OnMouseLeave(e);
+        if (!_closeHovered && !_closePressed) return;
+
+        _closeHovered = false;
+        _closePressed = false;
+        Cursor = Cursors.Default;
+        Invalidate(_closeRect);
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+        if (!_closePressed) return;
+
+        var shouldClose = _allowClose && _closeRect.Contains(e.Location);
+        _closePressed = false;
+        Invalidate(_closeRect);
+        if (shouldClose)
+            Close();
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        if (_allowClose)
+            DrawCloseIcon(e.Graphics);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _spinner.Dispose();
+            _windowIcon?.Dispose();
+        }
+        base.Dispose(disposing);
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        NativeWindowChrome.TryApplyRoundedCorners(Handle);
+        AcrylicBackdrop.TryApply(Handle, Color.FromArgb(18, 31, 42), 185);
+        ApplyDpiLayout();
+    }
+
+    protected override void OnDpiChanged(DpiChangedEventArgs e)
+    {
+        base.OnDpiChanged(e);
+        ApplyDpiLayout();
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        LayoutBorderStrips();
+        Invalidate();
+    }
+
+    private void ApplyDpiLayout()
+    {
+        var width = ScaleForDpi(336);
+        var height = ScaleForDpi(250);
+        if (ClientSize.Width != width || ClientSize.Height != height)
+            ClientSize = new Size(width, height);
+
+        var spinnerSize = ScaleForDpi(86);
+        _spinner.Size = new Size(spinnerSize, spinnerSize);
+        _spinner.Location = new Point((ClientSize.Width - _spinner.Width) / 2, ScaleForDpi(38));
+
+        _titleLabel.SetBounds(0, ScaleForDpi(126), ClientSize.Width, ScaleForDpi(34));
+        _subtitleLabel.SetBounds(ScaleForDpi(24), ScaleForDpi(161), ClientSize.Width - ScaleForDpi(48), ScaleForDpi(28));
+        _statusLabel.SetBounds(ScaleForDpi(24), ScaleForDpi(195), ClientSize.Width - ScaleForDpi(48), ScaleForDpi(28));
+        _versionLabel.SetBounds(
+            (ClientSize.Width - ScaleForDpi(80)) / 2,
+            ClientSize.Height - ScaleForDpi(25),
+            ScaleForDpi(80),
+            ScaleForDpi(18));
+
+        var closeSize = ScaleForDpi(28);
+        _closeRect = new Rectangle(ClientSize.Width - ScaleForDpi(36), ScaleForDpi(8), closeSize, closeSize);
+
+        LayoutBorderStrips();
+        Invalidate();
+    }
+
+    private int ScaleForDpi(int value) => (int)Math.Round(value * (DeviceDpi / 96F));
+
+    private float ScaleForDpi(float value) => value * (DeviceDpi / 96F);
+
+    private string FormatStatusText() => $"{_statusBaseText}{new string('.', _statusDotCount)}";
+
+    private static (string BaseText, int DotCount) SplitStatusDots(string status)
+    {
+        var trimmed = status.TrimEnd();
+        var dotCount = 0;
+        while (trimmed.EndsWith(".", StringComparison.Ordinal) && dotCount < 3)
+        {
+            dotCount++;
+            trimmed = trimmed[..^1];
+        }
+
+        return (trimmed, Math.Clamp(dotCount, 1, 3));
+    }
+
+    private void DrawCloseIcon(Graphics graphics)
+    {
+        if (_closeHovered || _closePressed)
+        {
+            using var background = new SolidBrush(_closePressed
+                ? Color.FromArgb(205, 38, 38)
+                : Color.FromArgb(232, 53, 53));
+            graphics.FillRectangle(background, _closeRect);
+        }
+
+        var color = _closeHovered || _closePressed
+            ? Color.White
+            : Color.FromArgb(184, 198, 209);
+
+        using var pen = new Pen(color, ScaleForDpi(2F))
+        {
+            StartCap = LineCap.Round,
+            EndCap = LineCap.Round,
+            LineJoin = LineJoin.Round
+        };
+
+        var scaleX = _closeRect.Width / 24F;
+        var scaleY = _closeRect.Height / 24F;
+        var offsetX = _closeRect.Left;
+        var offsetY = _closeRect.Top;
+        graphics.DrawLine(pen, offsetX + (18 * scaleX), offsetY + (6 * scaleY), offsetX + (6 * scaleX), offsetY + (18 * scaleY));
+        graphics.DrawLine(pen, offsetX + (6 * scaleX), offsetY + (6 * scaleY), offsetX + (18 * scaleX), offsetY + (18 * scaleY));
+    }
+
+    private Panel CreateBorderStrip()
+    {
+        var panel = new Panel
+        {
+            BackColor = LoaderBorderColor,
+            TabStop = false
+        };
+        return panel;
+    }
+
+    private static readonly Color LoaderBorderColor = Color.FromArgb(61, 66, 69);
+    private void LayoutBorderStrips()
+    {
+        if (_topBorder is null || _bottomBorder is null || _leftBorder is null || _rightBorder is null)
+            return;
+
+        var width = ClientSize.Width;
+        var height = ClientSize.Height;
+        if (width <= 0 || height <= 0) return;
+
+        var thickness = Math.Max(1, ScaleForDpi(1));
+        _topBorder.SetBounds(0, 0, width, thickness);
+        _bottomBorder.SetBounds(0, height - thickness, width, thickness);
+        _leftBorder.SetBounds(0, 0, thickness, height);
+        _rightBorder.SetBounds(width - thickness, 0, thickness, height);
+        _topBorder.BringToFront();
+        _bottomBorder.BringToFront();
+        _leftBorder.BringToFront();
+        _rightBorder.BringToFront();
+    }
+
+    private void DragMove()
+    {
+        ReleaseCapture();
+        SendMessage(Handle, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+    }
+
+    private void EnableDragMove(Control control)
+    {
+        control.MouseDown += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Left)
+                DragMove();
+        };
+    }
+
+    private const int WM_NCLBUTTONDOWN = 0x00A1;
+    private const int HTCAPTION = 0x0002;
+
+    [DllImport("user32.dll")]
+    private static extern bool ReleaseCapture();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, int wParam, int lParam);
+}
+
+static class NativeWindowChrome
+{
+    public static void TryApplyRoundedCorners(IntPtr hwnd)
+    {
+        try
+        {
+            var preference = DwmWindowCornerPreference.Round;
+            DwmSetWindowAttribute(hwnd, DwmWindowAttribute.WindowCornerPreference, ref preference, Marshal.SizeOf<int>());
+        }
+        catch
+        {
+            // Older Windows builds keep square corners.
+        }
+    }
+
+    private enum DwmWindowAttribute
+    {
+        WindowCornerPreference = 33
+    }
+
+    private enum DwmWindowCornerPreference
+    {
+        Default = 0,
+        DoNotRound = 1,
+        Round = 2,
+        RoundSmall = 3
+    }
+
+    [DllImport("dwmapi.dll", PreserveSig = true)]
+    private static extern int DwmSetWindowAttribute(
+        IntPtr hwnd,
+        DwmWindowAttribute dwAttribute,
+        ref DwmWindowCornerPreference pvAttribute,
+        int cbAttribute);
+}
+
+static class AcrylicBackdrop
+{
+    public static void TryApply(IntPtr hwnd, Color tint, byte opacity)
+    {
+        try
+        {
+            var accent = new AccentPolicy
+            {
+                AccentState = AccentState.AccentEnableAcrylicBlurBehind,
+                AccentFlags = 2,
+                GradientColor = ToAbgr(tint, opacity)
+            };
+
+            var size = Marshal.SizeOf<AccentPolicy>();
+            var pointer = Marshal.AllocHGlobal(size);
+            try
+            {
+                Marshal.StructureToPtr(accent, pointer, false);
+                var data = new WindowCompositionAttributeData
+                {
+                    Attribute = WindowCompositionAttribute.AccentPolicy,
+                    Data = pointer,
+                    SizeOfData = size
+                };
+                SetWindowCompositionAttribute(hwnd, ref data);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(pointer);
+            }
+        }
+        catch
+        {
+            // Windows versions without acrylic support keep the normal solid loader background.
+        }
+    }
+
+    private static int ToAbgr(Color color, byte alpha) =>
+        (alpha << 24) | (color.B << 16) | (color.G << 8) | color.R;
+
+    private enum AccentState
+    {
+        AccentDisabled = 0,
+        AccentEnableGradient = 1,
+        AccentEnableTransparentGradient = 2,
+        AccentEnableBlurBehind = 3,
+        AccentEnableAcrylicBlurBehind = 4
+    }
+
+    private enum WindowCompositionAttribute
+    {
+        AccentPolicy = 19
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct AccentPolicy
+    {
+        public AccentState AccentState;
+        public int AccentFlags;
+        public int GradientColor;
+        public int AnimationId;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WindowCompositionAttributeData
+    {
+        public WindowCompositionAttribute Attribute;
+        public IntPtr Data;
+        public int SizeOfData;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern int SetWindowCompositionAttribute(IntPtr hwnd, ref WindowCompositionAttributeData data);
+}
+
+static class LoaderImages
+{
+    public static Image? LoadLogo()
+    {
+        try
+        {
+            var assembly = Assembly.GetExecutingAssembly();
+            var resourceName = assembly
+                .GetManifestResourceNames()
+                .FirstOrDefault(name => name.EndsWith(".hubcaplogo.png", StringComparison.OrdinalIgnoreCase));
+            if (string.IsNullOrWhiteSpace(resourceName)) return null;
+
+            using var stream = assembly.GetManifestResourceStream(resourceName);
+            if (stream is null) return null;
+
+            using var image = Image.FromStream(stream);
+            using var bitmap = new Bitmap(image);
+            return CreatePaddedLogo(bitmap);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public static Icon? LoadIcon()
+    {
+        using var logo = LoadLogo();
+        if (logo is null) return null;
+
+        using var bitmap = new Bitmap(logo, new Size(64, 64));
+        var handle = bitmap.GetHicon();
+        try
+        {
+            return (Icon)Icon.FromHandle(handle).Clone();
+        }
+        finally
+        {
+            DestroyIcon(handle);
+        }
+    }
+
+    private static Bitmap CreatePaddedLogo(Bitmap source)
+    {
+        var padding = Math.Max(8, source.Width / 8);
+        var padded = new Bitmap(source.Width + (padding * 2), source.Height + (padding * 2), PixelFormat.Format32bppArgb);
+        using var graphics = Graphics.FromImage(padded);
+        graphics.Clear(Color.Transparent);
+        graphics.CompositingMode = CompositingMode.SourceOver;
+        graphics.CompositingQuality = CompositingQuality.HighQuality;
+        graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+        graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        graphics.DrawImage(source, padding, padding, source.Width, source.Height);
+        TrimLogoRim(padded, new Rectangle(padding, padding, source.Width, source.Height));
+        return padded;
+    }
+
+    private static void TrimLogoRim(Bitmap bitmap, Rectangle contentBounds)
+    {
+        var centerX = contentBounds.Left + ((contentBounds.Width - 1) / 2F);
+        var centerY = contentBounds.Top + ((contentBounds.Height - 1) / 2F);
+        var hardRadius = (Math.Min(contentBounds.Width, contentBounds.Height) / 2F) - 3.2F;
+        var softRadius = hardRadius + 2.2F;
+
+        for (var y = contentBounds.Top; y < contentBounds.Bottom; y++)
+        {
+            for (var x = contentBounds.Left; x < contentBounds.Right; x++)
+            {
+                var dx = x - centerX;
+                var dy = y - centerY;
+                var distance = MathF.Sqrt((dx * dx) + (dy * dy));
+                if (distance <= hardRadius)
+                    continue;
+
+                var pixel = bitmap.GetPixel(x, y);
+                if (pixel.A == 0)
+                    continue;
+
+                if (distance >= softRadius)
+                {
+                    bitmap.SetPixel(x, y, Color.FromArgb(0, pixel));
+                    continue;
+                }
+
+                var fade = 1F - ((distance - hardRadius) / (softRadius - hardRadius));
+                fade = fade * fade * (3F - (2F * fade));
+                bitmap.SetPixel(x, y, Color.FromArgb((int)Math.Round(pixel.A * fade), pixel));
+            }
+        }
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool DestroyIcon(IntPtr hIcon);
+}
+
+sealed class LogoSpinnerControl : Control
+{
+    private readonly System.Windows.Forms.Timer _timer;
+    private readonly Image? _logo;
+    private readonly Stopwatch _animationClock = Stopwatch.StartNew();
+
+    public LogoSpinnerControl()
+    {
+        SetStyle(
+            ControlStyles.AllPaintingInWmPaint |
+            ControlStyles.OptimizedDoubleBuffer |
+            ControlStyles.ResizeRedraw |
+            ControlStyles.SupportsTransparentBackColor |
+            ControlStyles.UserPaint,
+            true);
+
+        BackColor = Color.Transparent;
+        _logo = LoaderImages.LoadLogo();
+        _timer = new System.Windows.Forms.Timer { Interval = 15 };
+        _timer.Tick += (_, _) => Invalidate();
+        _timer.Start();
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+
+        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        e.Graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+        e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+
+        var size = Math.Min(ClientSize.Width, ClientSize.Height);
+        var ringInset = ScaleForDpi(8F);
+        var ringRect = new RectangleF(ringInset, ringInset, size - (ringInset * 2), size - (ringInset * 2));
+        using var track = new Pen(Color.FromArgb(42, 103, 193, 245), ScaleForDpi(2.75F));
+        using var arc = new Pen(Color.FromArgb(255, 45, 184, 255), ScaleForDpi(2.75F))
+        {
+            StartCap = LineCap.Round,
+            EndCap = LineCap.Round
+        };
+
+        e.Graphics.DrawEllipse(track, ringRect);
+        var angle = (float)((_animationClock.Elapsed.TotalSeconds * 220) % 360);
+        e.Graphics.DrawArc(arc, ringRect, angle, 278);
+
+        var logoSize = size - ScaleForDpi(14F);
+        var logoRect = new RectangleF(
+            (ClientSize.Width - logoSize) / 2F,
+            (ClientSize.Height - logoSize) / 2F,
+            logoSize,
+            logoSize);
+
+        if (_logo is not null)
+        {
+            e.Graphics.DrawImage(_logo, logoRect);
+        }
+        else
+        {
+            using var fallback = new SolidBrush(Color.FromArgb(255, 19, 135, 184));
+            e.Graphics.FillEllipse(fallback, logoRect);
+        }
+    }
+
+    private float ScaleForDpi(float value) => value * (DeviceDpi / 96F);
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _timer.Dispose();
+            _logo?.Dispose();
+        }
+        base.Dispose(disposing);
+    }
+
 }
 
 static class SteamLauncher
@@ -1522,6 +2502,9 @@ sealed class HubcapLauncher
     private readonly int _port;
     private readonly HubcapService _hubcap;
     private readonly ConcurrentDictionary<string, Task<ResolvedApp>> _resolvedApps = new();
+    private readonly TaskCompletionSource _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public Task Ready => _ready.Task;
 
     public HubcapLauncher(HttpClient http, int port)
     {
@@ -1628,6 +2611,7 @@ sealed class HubcapLauncher
         }
 
         Logger.Info(IsStoreTarget(target) ? "Attached to Steam Store." : "Attached to Steam Library context.");
+        _ready.TrySetResult();
         if (IsStoreTarget(target))
             _ = Task.Run(() => StoreWatchdogAsync(cdp));
         else if (IsSharedContextTarget(target))
