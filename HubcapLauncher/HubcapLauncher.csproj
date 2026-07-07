@@ -8,11 +8,14 @@
     <FileVersion>1.0.3.0</FileVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <ApplicationIcon>Assets\HubcapLauncher.ico</ApplicationIcon>
+    <ApplicationIcon>Assets\hubcaplogo.ico</ApplicationIcon>
     <UseWindowsForms>true</UseWindowsForms>
   </PropertyGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="Assets\hubcaplogo.png" />
+    <EmbeddedResource Include="Assets\Fonts\IBMPlexSans-Regular-loader.ttf" />
+    <EmbeddedResource Include="Assets\Fonts\IBMPlexSans-Bold-loader.ttf" />
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3351.48" />
   </ItemGroup>
 
