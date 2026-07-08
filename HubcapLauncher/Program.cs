@@ -33,6 +33,12 @@ try
         return;
     }
 
+    if (options.UpdatePromptPreview)
+    {
+        LauncherAutoUpdater.RunPromptPreview();
+        return;
+    }
+
     var needsSingleInstance = options.Mode == LauncherMode.Run;
     using var singleInstance = new Mutex(initiallyOwned: true, "Global\\HubcapLauncher", out var ownsInstance);
     if (needsSingleInstance && !ownsInstance && !options.AllowMultiple)
@@ -61,6 +67,20 @@ try
 
     using var loading = LoadingScreen.StartFor(options);
     Logger.Info("HubcapLauncher");
+
+    if (options.Mode == LauncherMode.Run &&
+        (!options.SkipUpdate || options.UpdateFailed || !string.IsNullOrWhiteSpace(options.UpdatedFromVersion)))
+    {
+        var update = await LauncherAutoUpdater.CheckAndApplyAsync(http, loading, options);
+        if (update.ShouldExit)
+            return;
+    }
+
+    if (options.Mode == LauncherMode.Run && options.ConfirmRestart)
+    {
+        if (!LauncherAutoUpdater.ConfirmRestart(options.UpdatedFromVersion))
+            return;
+    }
 
     var devToolsAlreadyOpen = await SteamLauncher.IsDevToolsReachableAsync(http, DevToolsPort);
     loading?.SetStatus(options.NoSteamLaunch
@@ -195,6 +215,12 @@ sealed class LauncherOptions
     public bool Quiet { get; init; }
     public bool AllowMultiple { get; init; }
     public bool LoadingTest { get; init; }
+    public bool UpdatePromptPreview { get; init; }
+    public bool SkipUpdate { get; init; }
+    public string UpdatedFromVersion { get; init; } = "";
+    public bool UpdateFailed { get; init; }
+    public bool ConfirmRestart { get; init; }
+    public string UpdateFeedUrl { get; init; } = "";
     public string LogPath { get; init; } = "";
     public LauncherMode Mode { get; init; } = LauncherMode.Run;
 
@@ -212,6 +238,14 @@ sealed class LauncherOptions
             Quiet = Has(args, "--quiet"),
             AllowMultiple = Has(args, "--allow-multiple"),
             LoadingTest = Has(args, "--loading-test"),
+            UpdatePromptPreview = Has(args, "--update-prompt-preview"),
+            SkipUpdate = Has(args, "--skip-update") || Has(args, "--updated-from") || Has(args, "--update-failed"),
+            UpdatedFromVersion = ValueAfter(args, "--updated-from") ?? "",
+            UpdateFailed = Has(args, "--update-failed"),
+            ConfirmRestart = Has(args, "--confirm-restart"),
+            UpdateFeedUrl = ValueAfter(args, "--update-feed-url") ??
+                Environment.GetEnvironmentVariable("HUBCAP_LAUNCHER_UPDATE_FEED_URL") ??
+                "",
             LogPath = ValueAfter(args, "--log") ?? "",
             Mode = mode
         };
@@ -575,6 +609,386 @@ static class AppVersion
     }
 }
 
+sealed record AutoUpdateResult(bool ShouldExit);
+
+static class UpdatePrompt
+{
+    public static bool ShowUpdateAvailable(string currentVersion, string latestVersion, string changelog) =>
+        Show(
+            title: "Update Available",
+            heading: $"HubcapLauncher v{latestVersion} is available",
+            message: $"You are running v{currentVersion}. Install the update now?",
+            changelog: changelog,
+            acceptText: "Update Now",
+            cancelText: "Later");
+
+    public static bool ShowRestart(string currentVersion, string previousVersion) =>
+        Show(
+            title: "Update Installed",
+            heading: $"HubcapLauncher v{currentVersion} is ready",
+            message: $"Updated from {previousVersion}. Start the new launcher now?",
+            changelog: "",
+            acceptText: "Restart Now",
+            cancelText: "Later");
+
+    private static bool Show(string title, string heading, string message, string changelog, string acceptText, string cancelText)
+    {
+        var result = false;
+        var done = new ManualResetEventSlim();
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                LoadingScreen.ConfigureHighDpi();
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(true);
+                using var form = new UpdatePromptForm(title, heading, message, changelog, acceptText, cancelText);
+                result = form.ShowDialog() == DialogResult.OK;
+            }
+            catch (Exception ex)
+            {
+                Logger.Info($"Update prompt unavailable: {ex.Message}");
+                result = false;
+            }
+            finally
+            {
+                done.Set();
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "HubcapLauncherUpdatePrompt"
+        };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        done.Wait();
+        done.Dispose();
+        return result;
+    }
+}
+
+static class LauncherAutoUpdater
+{
+    private const string LatestReleaseUrl = "https://api.github.com/repos/oogiefied/HubcapLauncher/releases/latest";
+    private const string ExecutableName = "HubcapLauncher.exe";
+
+    public static async Task<AutoUpdateResult> CheckAndApplyAsync(HttpClient http, LoadingScreen? loading, LauncherOptions options)
+    {
+        if (!string.IsNullOrWhiteSpace(options.UpdatedFromVersion))
+        {
+            loading?.SetStatus($"Updated to v{AppVersion.Current}...");
+            await Task.Delay(700);
+            return new AutoUpdateResult(false);
+        }
+
+        if (options.UpdateFailed)
+        {
+            loading?.SetStatus("Update failed. Starting current version...");
+            await Task.Delay(900);
+            return new AutoUpdateResult(false);
+        }
+
+        try
+        {
+            loading?.SetStatus("Checking for updates...");
+            using var checkCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+            var latest = await GetLatestReleaseAsync(http, options.UpdateFeedUrl, checkCts.Token);
+            if (latest is null || latest.Version <= ParseVersion(AppVersion.Current))
+            {
+                if (latest is not null)
+                    Logger.Info($"No launcher update available. Current={AppVersion.Current}, Latest={latest.TagName}.");
+                loading?.SetStatus("HubcapLauncher is up to date...");
+                await Task.Delay(350, checkCts.Token);
+                return new AutoUpdateResult(false);
+            }
+
+            Logger.Info($"Launcher update available. Current={AppVersion.Current}, Latest={latest.TagName}.");
+            if (!UpdatePrompt.ShowUpdateAvailable(AppVersion.Current, latest.TagName, latest.Changelog))
+            {
+                Logger.Info($"Launcher update skipped by user. Current={AppVersion.Current}, Latest={latest.TagName}.");
+                loading?.SetStatus("Update skipped. Starting current version...");
+                await Task.Delay(450);
+                return new AutoUpdateResult(false);
+            }
+
+            loading?.SetStatus($"Downloading v{latest.TagName}...");
+            using var downloadCts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+            var updateExe = await DownloadUpdateAsync(latest, downloadCts.Token);
+            var currentExe = ResolveCurrentExecutablePath();
+            if (string.IsNullOrWhiteSpace(currentExe) || !File.Exists(currentExe))
+                return new AutoUpdateResult(false);
+
+            loading?.SetStatus("Installing update...");
+            var launched = LaunchUpdater(updateExe, currentExe, latest.UpdateRoot, AppVersion.Current);
+            if (!launched)
+            {
+                loading?.SetStatus("Update could not start. Continuing...");
+                await Task.Delay(900);
+                return new AutoUpdateResult(false);
+            }
+
+            loading?.SetStatus("Restarting updated launcher...");
+            await Task.Delay(500);
+            loading?.Close();
+            return new AutoUpdateResult(true);
+        }
+        catch (OperationCanceledException)
+        {
+            loading?.SetStatus("Update check timed out. Continuing...");
+            await Task.Delay(700);
+            return new AutoUpdateResult(false);
+        }
+        catch (Exception ex)
+        {
+            Logger.Info($"Update check failed: {ex.Message}");
+            loading?.SetStatus("Update check skipped. Continuing...");
+            await Task.Delay(700);
+            return new AutoUpdateResult(false);
+        }
+    }
+
+    public static bool ConfirmRestart(string previousVersion)
+    {
+        var from = string.IsNullOrWhiteSpace(previousVersion) ? "the previous version" : $"v{previousVersion}";
+        return UpdatePrompt.ShowRestart(AppVersion.Current, from);
+    }
+
+    public static void RunPromptPreview()
+    {
+        var acceptedUpdate = UpdatePrompt.ShowUpdateAvailable(
+            AppVersion.Current,
+            "1.0.5",
+            """
+            - Added Group Lua persistence outside config.yaml
+            - Improved Library button placement
+            - Added update prompts and changelog display
+            """);
+        if (acceptedUpdate)
+            UpdatePrompt.ShowRestart("1.0.5", $"v{AppVersion.Current}");
+    }
+
+    private static async Task<LatestRelease?> GetLatestReleaseAsync(HttpClient http, string updateFeedUrl, CancellationToken cancellationToken)
+    {
+        var latestReleaseUrl = string.IsNullOrWhiteSpace(updateFeedUrl) ? LatestReleaseUrl : updateFeedUrl.Trim();
+        if (TryResolveLocalPath(latestReleaseUrl, out var localFeedPath))
+        {
+            await using var localStream = File.OpenRead(localFeedPath);
+            return await ParseLatestReleaseAsync(localStream, cancellationToken);
+        }
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, latestReleaseUrl);
+        request.Headers.UserAgent.ParseAdd($"HubcapLauncher/{AppVersion.Current}");
+        request.Headers.Accept.ParseAdd("application/vnd.github+json");
+
+        using var response = await http.SendAsync(request, cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            Logger.Info($"Update check returned {(int)response.StatusCode} {response.ReasonPhrase}.");
+            return null;
+        }
+
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        return await ParseLatestReleaseAsync(stream, cancellationToken);
+    }
+
+    private static async Task<LatestRelease?> ParseLatestReleaseAsync(Stream stream, CancellationToken cancellationToken)
+    {
+        using var json = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+        var root = json.RootElement;
+        var tag = root.TryGetProperty("tag_name", out var tagNode) ? tagNode.GetString() ?? "" : "";
+        var body = root.TryGetProperty("body", out var bodyNode) && bodyNode.ValueKind == JsonValueKind.String
+            ? bodyNode.GetString() ?? ""
+            : "";
+        var version = ParseVersion(tag);
+        if (version <= new Version(0, 0))
+            return null;
+
+        if (!root.TryGetProperty("assets", out var assets) || assets.ValueKind != JsonValueKind.Array)
+            return null;
+
+        foreach (var asset in assets.EnumerateArray())
+        {
+            var name = asset.TryGetProperty("name", out var nameNode) ? nameNode.GetString() ?? "" : "";
+            var downloadUrl = asset.TryGetProperty("browser_download_url", out var urlNode) ? urlNode.GetString() ?? "" : "";
+            if (string.IsNullOrWhiteSpace(downloadUrl)) continue;
+            if (!name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)) continue;
+            if (!name.Contains("HubcapLauncher", StringComparison.OrdinalIgnoreCase)) continue;
+
+            return new LatestRelease(tag.TrimStart('v', 'V'), version, downloadUrl, body);
+        }
+
+        return null;
+    }
+
+    private static async Task<string> DownloadUpdateAsync(LatestRelease latest, CancellationToken cancellationToken)
+    {
+        var updateRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "HubcapLauncher",
+            "updates");
+        TryDeleteDirectory(updateRoot);
+        Directory.CreateDirectory(updateRoot);
+
+        var zipPath = Path.Combine(updateRoot, $"HubcapLauncher-{latest.TagName}.zip");
+        if (TryResolveLocalPath(latest.DownloadUrl, out var localZipPath))
+        {
+            File.Copy(localZipPath, zipPath, overwrite: true);
+        }
+        else
+        {
+            using var downloadHttp = new HttpClient { Timeout = TimeSpan.FromMinutes(2) };
+            using var request = new HttpRequestMessage(HttpMethod.Get, latest.DownloadUrl);
+            {
+                request.Headers.UserAgent.ParseAdd($"HubcapLauncher/{AppVersion.Current}");
+                using var response = await downloadHttp.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+                response.EnsureSuccessStatusCode();
+                await using var input = await response.Content.ReadAsStreamAsync(cancellationToken);
+                await using var output = File.Create(zipPath);
+                await input.CopyToAsync(output, cancellationToken);
+            }
+        }
+
+        var extractDir = Path.Combine(updateRoot, "extract");
+        Directory.CreateDirectory(extractDir);
+        ZipFile.ExtractToDirectory(zipPath, extractDir, overwriteFiles: true);
+
+        var exe = Directory
+            .EnumerateFiles(extractDir, ExecutableName, SearchOption.AllDirectories)
+            .FirstOrDefault();
+
+        if (string.IsNullOrWhiteSpace(exe))
+            throw new InvalidOperationException("Downloaded update did not contain HubcapLauncher.exe.");
+
+        latest.UpdateRoot = updateRoot;
+        return exe;
+    }
+
+    private static bool LaunchUpdater(string updateExe, string currentExe, string updateRoot, string previousVersion)
+    {
+        try
+        {
+            var scriptPath = Path.Combine(updateRoot, "apply-update.cmd");
+            var currentPid = Environment.ProcessId;
+            var escapedUpdateRoot = EscapeCmdValue(updateRoot);
+            File.WriteAllText(scriptPath, $"""
+@echo off
+setlocal
+set "PID={currentPid}"
+set "SRC={EscapeCmdValue(updateExe)}"
+set "DST={EscapeCmdValue(currentExe)}"
+set "ROOT={escapedUpdateRoot}"
+set "PREV={EscapeCmdValue(previousVersion)}"
+
+:wait
+tasklist /FI "PID eq %PID%" 2>NUL | find "%PID%" >NUL
+if not errorlevel 1 (
+  timeout /t 1 /nobreak >NUL
+  goto wait
+)
+
+copy /Y "%SRC%" "%DST%" >NUL
+if errorlevel 1 (
+  start "" "%DST%" --update-failed
+  exit /b 1
+)
+
+start "" "%DST%" --confirm-restart --updated-from "%PREV%"
+cd /d "%TEMP%"
+rmdir /s /q "%ROOT%" >NUL 2>NUL
+del "%~f0" >NUL 2>NUL
+""", Encoding.ASCII);
+
+            using var process = Process.Start(new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = $"/c \"{scriptPath}\"",
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                WindowStyle = ProcessWindowStyle.Hidden
+            });
+
+            return process is not null;
+        }
+        catch (Exception ex)
+        {
+            Logger.Info($"Could not launch updater: {ex.Message}");
+            return false;
+        }
+    }
+
+    private static bool TryResolveLocalPath(string value, out string path)
+    {
+        path = "";
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        if (Uri.TryCreate(value, UriKind.Absolute, out var uri) && uri.IsFile)
+        {
+            path = uri.LocalPath;
+            return File.Exists(path);
+        }
+
+        if (File.Exists(value))
+        {
+            path = value;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static string ResolveCurrentExecutablePath()
+    {
+        if (!string.IsNullOrWhiteSpace(Environment.ProcessPath))
+            return Environment.ProcessPath;
+
+        try
+        {
+            return Process.GetCurrentProcess().MainModule?.FileName ?? "";
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    private static Version ParseVersion(string version)
+    {
+        var clean = version.Trim().TrimStart('v', 'V');
+        var suffixIndex = clean.IndexOfAny(['-', '+']);
+        if (suffixIndex >= 0)
+            clean = clean[..suffixIndex];
+
+        return Version.TryParse(clean, out var parsed) ? parsed : new Version(0, 0);
+    }
+
+    private static string EscapeCmdValue(string value) =>
+        value.Replace("^", "^^", StringComparison.Ordinal)
+            .Replace("&", "^&", StringComparison.Ordinal)
+            .Replace("|", "^|", StringComparison.Ordinal)
+            .Replace("<", "^<", StringComparison.Ordinal)
+            .Replace(">", "^>", StringComparison.Ordinal)
+            .Replace("\"", "\\\"", StringComparison.Ordinal);
+
+    private static void TryDeleteDirectory(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+                Directory.Delete(path, recursive: true);
+        }
+        catch
+        {
+            // A stale update folder should not block launching.
+        }
+    }
+
+    private sealed record LatestRelease(string TagName, Version Version, string DownloadUrl, string Changelog)
+    {
+        public string UpdateRoot { get; set; } = "";
+    }
+}
+
 sealed class LoadingForm : Form
 {
     private readonly Icon? _windowIcon;
@@ -607,7 +1021,7 @@ sealed class LoadingForm : Form
         TopMost = true;
         Opacity = 1.0;
         AutoScaleMode = AutoScaleMode.None;
-        BackColor = Color.FromArgb(18, 31, 42);
+        BackColor = LoaderFallbackBackground;
         ForeColor = Color.White;
         Font = LoaderFonts.Regular(9F);
         Padding = Padding.Empty;
@@ -629,7 +1043,7 @@ sealed class LoadingForm : Form
             Font = LoaderFonts.Bold(18F),
             BackColor = Color.Transparent,
             ForeColor = Color.White,
-            UseCompatibleTextRendering = true
+            UseCompatibleTextRendering = false
         };
 
         _subtitleLabel = new Label
@@ -640,7 +1054,7 @@ sealed class LoadingForm : Form
             Font = LoaderFonts.Regular(10F),
             BackColor = Color.Transparent,
             ForeColor = Color.FromArgb(184, 198, 209),
-            UseCompatibleTextRendering = true
+            UseCompatibleTextRendering = false
         };
 
         var initial = SplitStatusDots(initialStatus);
@@ -655,7 +1069,7 @@ sealed class LoadingForm : Form
             Font = LoaderFonts.Regular(9.5F),
             BackColor = Color.Transparent,
             ForeColor = Color.FromArgb(103, 193, 245),
-            UseCompatibleTextRendering = true
+            UseCompatibleTextRendering = false
         };
 
         _versionLabel = new Label
@@ -663,10 +1077,10 @@ sealed class LoadingForm : Form
             AutoSize = false,
             Text = $"V{AppVersion.Current}",
             TextAlign = ContentAlignment.MiddleCenter,
-            Font = LoaderFonts.Regular(10F),
+            Font = LoaderFonts.Regular(8F),
             BackColor = Color.Transparent,
-            ForeColor = Color.FromArgb(81, 92, 101),
-            UseCompatibleTextRendering = true
+            ForeColor = Color.FromArgb(142, 158, 170),
+            UseCompatibleTextRendering = false
         };
 
         _topBorder = CreateBorderStrip();
@@ -781,7 +1195,8 @@ sealed class LoadingForm : Form
     {
         base.OnHandleCreated(e);
         NativeWindowChrome.TryApplyRoundedCorners(Handle);
-        AcrylicBackdrop.TryApply(Handle, Color.FromArgb(18, 31, 42), 185);
+        BackColor = LoaderFallbackBackground;
+        TransparencyKey = Color.Empty;
         ApplyDpiLayout();
     }
 
@@ -883,7 +1298,8 @@ sealed class LoadingForm : Form
         return panel;
     }
 
-    private static readonly Color LoaderBorderColor = Color.FromArgb(61, 66, 69);
+    private static readonly Color LoaderFallbackBackground = Color.FromArgb(27, 40, 56);
+    private static readonly Color LoaderBorderColor = Color.FromArgb(58, 78, 94);
     private void LayoutBorderStrips()
     {
         if (_topBorder is null || _bottomBorder is null || _leftBorder is null || _rightBorder is null)
@@ -927,6 +1343,221 @@ sealed class LoadingForm : Form
 
     [DllImport("user32.dll")]
     private static extern IntPtr SendMessage(IntPtr hWnd, int msg, int wParam, int lParam);
+}
+
+sealed class UpdatePromptForm : Form
+{
+    private static readonly string UiFamilyName = ResolveUiFamilyName();
+    private static readonly Color Background = Color.FromArgb(27, 40, 56);
+    private static readonly Color PanelBackground = Color.FromArgb(13, 27, 39);
+    private static readonly Color BorderColor = Color.FromArgb(58, 78, 94);
+    private static readonly Color AccentColor = Color.FromArgb(103, 193, 245);
+    private static readonly Color SuccessColor = Color.FromArgb(164, 208, 7);
+    private readonly Label _headingLabel;
+    private readonly Label _messageLabel;
+    private readonly TextBox _changelogBox;
+    private readonly Button _acceptButton;
+    private readonly Button _cancelButton;
+    private readonly Panel _topBorder;
+    private readonly Panel _bottomBorder;
+    private readonly Panel _leftBorder;
+    private readonly Panel _rightBorder;
+    private readonly bool _hasChangelog;
+    private readonly Icon? _windowIcon;
+
+    public UpdatePromptForm(string title, string heading, string message, string changelog, string acceptText, string cancelText)
+    {
+        Text = title;
+        StartPosition = FormStartPosition.CenterScreen;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        MinimizeBox = false;
+        ShowInTaskbar = true;
+        TopMost = true;
+        AutoScaleMode = AutoScaleMode.None;
+        BackColor = Background;
+        ForeColor = Color.White;
+        Font = UiFont(9F);
+        ClientSize = new Size(500, string.IsNullOrWhiteSpace(changelog) ? 184 : 386);
+        MinimumSize = new Size(440, 210);
+        _windowIcon = LoaderImages.LoadIcon();
+        if (_windowIcon is not null)
+            Icon = _windowIcon;
+
+        _hasChangelog = !string.IsNullOrWhiteSpace(changelog);
+        _topBorder = CreateBorderStrip();
+        _bottomBorder = CreateBorderStrip();
+        _leftBorder = CreateBorderStrip();
+        _rightBorder = CreateBorderStrip();
+
+        _headingLabel = new Label
+        {
+            AutoSize = false,
+            Text = heading,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Font = UiFont(13F, FontStyle.Bold),
+            BackColor = Color.Transparent,
+            ForeColor = Color.White,
+            UseCompatibleTextRendering = false
+        };
+
+        _messageLabel = new Label
+        {
+            AutoSize = false,
+            Text = message,
+            TextAlign = ContentAlignment.TopLeft,
+            Font = UiFont(9.5F),
+            BackColor = Color.Transparent,
+            ForeColor = Color.FromArgb(184, 198, 209),
+            UseCompatibleTextRendering = false
+        };
+
+        _changelogBox = new TextBox
+        {
+            Multiline = true,
+            ReadOnly = true,
+            ScrollBars = ScrollBars.Vertical,
+            BorderStyle = BorderStyle.FixedSingle,
+            BackColor = Color.FromArgb(10, 24, 36),
+            ForeColor = Color.FromArgb(214, 244, 255),
+            Font = UiFont(9F),
+            HideSelection = true,
+            TabStop = false,
+            Text = FormatChangelog(changelog),
+            Visible = _hasChangelog
+        };
+
+        _acceptButton = CreateButton(acceptText, primary: true);
+        _acceptButton.DialogResult = DialogResult.OK;
+        _cancelButton = CreateButton(cancelText, primary: false);
+        _cancelButton.DialogResult = DialogResult.Cancel;
+        AcceptButton = _acceptButton;
+        CancelButton = _cancelButton;
+
+        Controls.Add(_headingLabel);
+        Controls.Add(_messageLabel);
+        Controls.Add(_changelogBox);
+        Controls.Add(_acceptButton);
+        Controls.Add(_cancelButton);
+        Controls.Add(_topBorder);
+        Controls.Add(_bottomBorder);
+        Controls.Add(_leftBorder);
+        Controls.Add(_rightBorder);
+        ApplyPromptLayout();
+        Shown += (_, _) =>
+        {
+            _changelogBox.SelectionStart = 0;
+            _changelogBox.SelectionLength = 0;
+            _acceptButton.Select();
+        };
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        ApplyPromptLayout();
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        using var background = new LinearGradientBrush(ClientRectangle, Color.FromArgb(18, 38, 53), Color.FromArgb(10, 21, 32), 135F);
+        e.Graphics.FillRectangle(background, ClientRectangle);
+        using var glow = new SolidBrush(Color.FromArgb(32, AccentColor));
+        e.Graphics.FillRectangle(glow, new Rectangle(0, 0, ClientSize.Width, ScaleForDpi(48)));
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+            _windowIcon?.Dispose();
+        base.Dispose(disposing);
+    }
+
+    private void ApplyPromptLayout()
+    {
+        if (_topBorder is null || _bottomBorder is null || _leftBorder is null || _rightBorder is null ||
+            _headingLabel is null || _messageLabel is null || _changelogBox is null ||
+            _acceptButton is null || _cancelButton is null)
+        {
+            return;
+        }
+
+        var pad = ScaleForDpi(16);
+        var buttonWidth = ScaleForDpi(104);
+        var buttonHeight = ScaleForDpi(30);
+        var buttonTop = ClientSize.Height - pad - buttonHeight;
+        var border = Math.Max(1, ScaleForDpi(1));
+
+        _topBorder.SetBounds(0, 0, ClientSize.Width, border);
+        _bottomBorder.SetBounds(0, ClientSize.Height - border, ClientSize.Width, border);
+        _leftBorder.SetBounds(0, 0, border, ClientSize.Height);
+        _rightBorder.SetBounds(ClientSize.Width - border, 0, border, ClientSize.Height);
+
+        _headingLabel.SetBounds(pad, ScaleForDpi(16), ClientSize.Width - (pad * 2), ScaleForDpi(28));
+        _messageLabel.SetBounds(pad, ScaleForDpi(50), ClientSize.Width - (pad * 2), ScaleForDpi(42));
+        if (_hasChangelog)
+            _changelogBox.SetBounds(pad, ScaleForDpi(104), ClientSize.Width - (pad * 2), Math.Max(ScaleForDpi(104), buttonTop - ScaleForDpi(116)));
+
+        _cancelButton.SetBounds(ClientSize.Width - pad - buttonWidth, buttonTop, buttonWidth, buttonHeight);
+        _acceptButton.SetBounds(_cancelButton.Left - ScaleForDpi(10) - buttonWidth, buttonTop, buttonWidth, buttonHeight);
+        _topBorder.BringToFront();
+        _bottomBorder.BringToFront();
+        _leftBorder.BringToFront();
+        _rightBorder.BringToFront();
+    }
+
+    private Button CreateButton(string text, bool primary)
+    {
+        var button = new Button
+        {
+            Text = text,
+            FlatStyle = FlatStyle.Flat,
+            Font = UiFont(9F, FontStyle.Bold),
+            ForeColor = primary ? Color.White : Color.FromArgb(214, 244, 255),
+            BackColor = primary ? Color.FromArgb(82, 124, 20) : PanelBackground,
+            UseVisualStyleBackColor = false,
+            Cursor = Cursors.Hand
+        };
+        button.FlatAppearance.BorderColor = primary ? SuccessColor : AccentColor;
+        button.FlatAppearance.MouseOverBackColor = primary ? Color.FromArgb(102, 151, 27) : Color.FromArgb(26, 52, 70);
+        button.FlatAppearance.MouseDownBackColor = primary ? Color.FromArgb(67, 101, 16) : Color.FromArgb(18, 38, 53);
+        return button;
+    }
+
+    private static Panel CreateBorderStrip() => new()
+    {
+        BackColor = BorderColor,
+        TabStop = false
+    };
+
+    private static string FormatChangelog(string changelog)
+    {
+        changelog = (changelog ?? "").Trim();
+        return string.IsNullOrWhiteSpace(changelog)
+            ? "No changelog provided."
+            : changelog.Replace("\r\n", "\n", StringComparison.Ordinal).Replace("\n", Environment.NewLine, StringComparison.Ordinal);
+    }
+
+    private static Font UiFont(float size, FontStyle style = FontStyle.Regular) => new(UiFamilyName, size, style, GraphicsUnit.Point);
+
+    private static string ResolveUiFamilyName()
+    {
+        try
+        {
+            using var fonts = new InstalledFontCollection();
+            var names = fonts.Families.Select(family => family.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (names.Contains("Motiva Sans")) return "Motiva Sans";
+            if (names.Contains("Motiva Sans Regular")) return "Motiva Sans Regular";
+            if (names.Contains("Arial")) return "Arial";
+        }
+        catch { }
+
+        return "Segoe UI";
+    }
+
+    private int ScaleForDpi(int value) => (int)Math.Round(value * (DeviceDpi / 96F));
 }
 
 static class NativeWindowChrome
@@ -1625,272 +2256,6 @@ static class FolderPicker
     }
 }
 
-static class SteamDbManifestPicker
-{
-    public static List<LuaManifestOptionState> Pick(string depotId, string currentManifestId)
-    {
-        if (Thread.CurrentThread.GetApartmentState() == ApartmentState.STA)
-            return PickOnSta(depotId, currentManifestId);
-
-        List<LuaManifestOptionState>? options = null;
-        Exception? error = null;
-        var thread = new Thread(() =>
-        {
-            try
-            {
-                options = PickOnSta(depotId, currentManifestId);
-            }
-            catch (Exception ex)
-            {
-                error = ex;
-            }
-        });
-
-        thread.SetApartmentState(ApartmentState.STA);
-        thread.Start();
-        thread.Join();
-
-        if (error is not null) throw error;
-        return options ?? [];
-    }
-
-    private static List<LuaManifestOptionState> PickOnSta(string depotId, string currentManifestId)
-    {
-        var result = new List<LuaManifestOptionState>();
-        using var form = new System.Windows.Forms.Form
-        {
-            Text = $"SteamDB Manifests - Depot {depotId}",
-            Width = 900,
-            Height = 660,
-            StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen,
-            MinimizeBox = false,
-            MaximizeBox = true,
-            ShowInTaskbar = true,
-            TopMost = true
-        };
-
-        var webView = new WebView2 { Dock = System.Windows.Forms.DockStyle.Fill };
-        var bottom = new System.Windows.Forms.Panel
-        {
-            Dock = System.Windows.Forms.DockStyle.Bottom,
-            Height = 44,
-            Padding = new System.Windows.Forms.Padding(8)
-        };
-        var status = new System.Windows.Forms.Label
-        {
-            AutoSize = false,
-            Dock = System.Windows.Forms.DockStyle.Fill,
-            Text = "Loading SteamDB...",
-            TextAlign = System.Drawing.ContentAlignment.MiddleLeft
-        };
-        var useButton = new System.Windows.Forms.Button
-        {
-            Text = "Use visible manifests",
-            Dock = System.Windows.Forms.DockStyle.Right,
-            Width = 150,
-            Enabled = false
-        };
-        var cancelButton = new System.Windows.Forms.Button
-        {
-            Text = "Cancel",
-            Dock = System.Windows.Forms.DockStyle.Right,
-            Width = 82
-        };
-        bottom.Controls.Add(status);
-        bottom.Controls.Add(cancelButton);
-        bottom.Controls.Add(useButton);
-        form.Controls.Add(webView);
-        form.Controls.Add(bottom);
-
-        var latest = new List<LuaManifestOptionState>();
-        var timer = new System.Windows.Forms.Timer { Interval = 1200 };
-        var timeout = new System.Windows.Forms.Timer { Interval = 120000 };
-
-        async Task ExtractAsync(bool closeOnSuccess)
-        {
-            if (webView.CoreWebView2 is null) return;
-            try
-            {
-                var json = await webView.CoreWebView2.ExecuteScriptAsync("""
-(() => {
-  const text = document.body?.innerText || "";
-  const rows = [];
-  const seen = new Set();
-  const datePattern = "\\d{1,2}\\s+[A-Za-z]+\\s+\\d{4}(?:\\s+[\\u2013\\u2014-]\\s+\\d{2}:\\d{2}(?::\\d{2})?\\s+UTC|,\\s+[A-Za-z]{3},\\s+\\d{2}:\\d{2}|\\s+[A-Za-z]{3}\\s+\\d{2}:\\d{2})";
-  const dateRe = new RegExp(datePattern, "i");
-  const manifestRe = /\b\d{12,20}\b/g;
-  const add = (manifestId, date) => {
-    manifestId = String(manifestId || "").trim();
-    date = String(date || "").trim();
-    if (!/^\d{12,20}$/.test(manifestId) || seen.has(manifestId)) return;
-    seen.add(manifestId);
-    rows.push({ manifestId, date });
-  };
-  const dateFrom = value => (String(value || "").match(dateRe) || [""])[0];
-  const display = text.match(/Displaying manifest\s+(\d{12,20})\s+dated\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4}\s+[–—-]\s+\d{2}:\d{2}:\d{2}\s+UTC)/i);
-  if (display) add(display[1], display[2]);
-  const displayFallback = text.match(new RegExp("Displaying manifest\\s+(\\d{12,20})\\s+dated\\s+(" + datePattern + ")", "i"));
-  if (displayFallback) add(displayFallback[1], displayFallback[2]);
-
-  for (const link of document.querySelectorAll("a[href], a")) {
-    const combined = `${link.textContent || ""} ${link.getAttribute("href") || ""}`;
-    const manifestIds = combined.match(manifestRe) || [];
-    if (!manifestIds.length) continue;
-    const row = link.closest("tr") || link.closest("li") || link.parentElement;
-    let date = dateFrom(row?.innerText || "");
-    if (!date && row?.previousElementSibling) date = dateFrom(row.previousElementSibling.innerText || "");
-    for (const manifestId of manifestIds) add(manifestId, date);
-  }
-
-  for (const row of document.querySelectorAll("tr")) {
-    const rowText = row.innerText || "";
-    const date = dateFrom(rowText);
-    const manifestIds = rowText.match(manifestRe) || [];
-    for (const manifestId of manifestIds) add(manifestId, date);
-  }
-  const start = text.search(/Previously seen manifests/i);
-  const section = start >= 0 ? text.slice(start) : text;
-  const re = /(\d{1,2}\s+[A-Za-z]+\s+\d{4}\s+[–—-]\s+\d{2}:\d{2}:\d{2}\s+UTC)\s+(\d{12,20})/gi;
-  let match;
-  while ((match = re.exec(section)) !== null) add(match[2], match[1]);
-  const lines = section.split(/\n+/).map(line => line.trim()).filter(Boolean);
-  let lastDate = "";
-  for (const line of lines) {
-    const date = dateFrom(line);
-    if (date) lastDate = date;
-    const manifestIds = line.match(manifestRe) || [];
-    for (const manifestId of manifestIds) add(manifestId, lastDate);
-  }
-  return rows;
-})()
-""");
-                var rows = JsonSerializer.Deserialize<List<SteamDbManifestRow>>(json, JsonOptions.Default) ?? [];
-                latest = RowsToOptions(rows, currentManifestId);
-                if (latest.Count > 0)
-                {
-                    useButton.Enabled = true;
-                    status.Text = $"Found {latest.Count} manifest rows. Importing...";
-                    if (closeOnSuccess && latest.Count > 1)
-                    {
-                        result = latest;
-                        timer.Stop();
-                        form.Close();
-                    }
-                }
-                else
-                {
-                    status.Text = "No manifest rows found yet. Finish any browser check, then use visible manifests.";
-                }
-            }
-            catch (Exception ex)
-            {
-                status.Text = $"Could not read page yet: {ex.Message}";
-            }
-        }
-
-        useButton.Click += async (_, _) =>
-        {
-            await ExtractAsync(closeOnSuccess: false);
-            result = latest;
-            form.Close();
-        };
-        cancelButton.Click += (_, _) =>
-        {
-            result = [];
-            form.Close();
-        };
-        timer.Tick += async (_, _) => await ExtractAsync(closeOnSuccess: true);
-        timeout.Tick += (_, _) =>
-        {
-            timeout.Stop();
-            result = latest;
-            form.Close();
-        };
-        form.FormClosed += (_, _) =>
-        {
-            timer.Stop();
-            timeout.Stop();
-        };
-
-        form.Shown += async (_, _) =>
-        {
-            try
-            {
-                form.WindowState = System.Windows.Forms.FormWindowState.Normal;
-                form.Show();
-                form.BringToFront();
-                form.Activate();
-                _ = Task.Delay(2500).ContinueWith(_ =>
-                {
-                    if (!form.IsDisposed)
-                    {
-                        try { form.BeginInvoke(() => form.TopMost = false); } catch { }
-                    }
-                });
-                timeout.Start();
-                var userDataFolder = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "HubcapLauncher",
-                    "SteamDbWebView2");
-                Directory.CreateDirectory(userDataFolder);
-                var environment = await CoreWebView2Environment.CreateAsync(null, userDataFolder);
-                await webView.EnsureCoreWebView2Async(environment);
-                webView.CoreWebView2.Settings.AreDevToolsEnabled = false;
-                webView.CoreWebView2.NavigationCompleted += async (_, _) =>
-                {
-                    await ExtractAsync(closeOnSuccess: true);
-                    timer.Start();
-                };
-                webView.CoreWebView2.Navigate($"https://steamdb.info/depot/{Uri.EscapeDataString(depotId)}/manifests/");
-            }
-            catch (Exception ex)
-            {
-                status.Text = $"WebView2 failed: {ex.Message}";
-            }
-        };
-
-        System.Windows.Forms.Application.Run(form);
-        return result;
-    }
-
-    private static List<LuaManifestOptionState> RowsToOptions(List<SteamDbManifestRow> rows, string currentManifestId)
-    {
-        var options = new Dictionary<string, LuaManifestOptionState>(StringComparer.OrdinalIgnoreCase);
-        foreach (var row in rows)
-        {
-            var manifestId = row.ManifestId.Trim();
-            if (!Regex.IsMatch(manifestId, @"^\d{12,20}$")) continue;
-            var isCurrent = string.Equals(manifestId, currentManifestId, StringComparison.OrdinalIgnoreCase);
-            var date = row.Date.Trim();
-            options[manifestId] = new LuaManifestOptionState
-            {
-                ManifestId = manifestId,
-                Date = date,
-                Label = string.IsNullOrWhiteSpace(date) ? $"{manifestId}{(isCurrent ? " (current)" : "")}" : $"{manifestId} - {date}{(isCurrent ? " (current)" : "")}",
-                IsCurrent = isCurrent
-            };
-        }
-
-        if (!string.IsNullOrWhiteSpace(currentManifestId) && !options.ContainsKey(currentManifestId))
-        {
-            options[currentManifestId] = new LuaManifestOptionState
-            {
-                ManifestId = currentManifestId,
-                Label = $"{currentManifestId} (current)",
-                IsCurrent = true
-            };
-        }
-
-        return options.Values.ToList();
-    }
-
-    private sealed class SteamDbManifestRow
-    {
-        public string ManifestId { get; set; } = "";
-        public string Date { get; set; } = "";
-    }
-}
-
 static class SteamDbVersionPicker
 {
     public static List<LuaManifestOptionState> Pick(string appId, string depotId, string currentManifestId, bool visible = false)
@@ -2369,15 +2734,28 @@ static class SteamDbVersionPicker
             .Where(row => !string.IsNullOrWhiteSpace(row.Key) && !string.IsNullOrWhiteSpace(row.BuildId))
             .GroupBy(row => row.Key, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(group => group.Key, group => group.First().BuildId.Trim(), StringComparer.OrdinalIgnoreCase);
+        var buildRowsInDisplayOrder = buildRows
+            .Where(row => Regex.IsMatch(row.BuildId.Trim(), @"^\d{5,12}$"))
+            .ToList();
+        var useDisplayOrderFallback = manifestRows.Count > 0 &&
+            buildRowsInDisplayOrder.Count >= manifestRows.Count &&
+            !manifestRows.Any(row => buildByDate.ContainsKey(SteamDbTimestampKey(row.Date)));
         var options = new Dictionary<string, LuaManifestOptionState>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var row in manifestRows)
+        for (var index = 0; index < manifestRows.Count; index++)
         {
+            var row = manifestRows[index];
             var manifestId = row.ManifestId.Trim();
             if (!Regex.IsMatch(manifestId, @"^\d{12,20}$")) continue;
             var isCurrent = string.Equals(manifestId, currentManifestId, StringComparison.OrdinalIgnoreCase);
             var date = row.Date.Trim();
             buildByDate.TryGetValue(SteamDbTimestampKey(date), out var buildId);
+            if (string.IsNullOrWhiteSpace(buildId) &&
+                useDisplayOrderFallback &&
+                index < buildRowsInDisplayOrder.Count)
+            {
+                buildId = buildRowsInDisplayOrder[index].BuildId.Trim();
+            }
             var label = !string.IsNullOrWhiteSpace(buildId)
                 ? $"{buildId} - {manifestId}"
                 : manifestId;
@@ -2496,13 +2874,54 @@ static class WindowOwner
     private static extern IntPtr GetForegroundWindow();
 }
 
+static class MouseInput
+{
+    private const int VkLButton = 0x01;
+
+    public static bool TryGetCursor(out Point point)
+    {
+        if (GetCursorPos(out var nativePoint))
+        {
+            point = new Point(nativePoint.X, nativePoint.Y);
+            return true;
+        }
+
+        point = Point.Empty;
+        return false;
+    }
+
+    public static bool IsLeftDown() => (GetAsyncKeyState(VkLButton) & 0x8000) != 0;
+
+    [DllImport("user32.dll")]
+    private static extern bool GetCursorPos(out NativePoint lpPoint);
+
+    [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int vKey);
+
+    private struct NativePoint
+    {
+        public int X;
+        public int Y;
+    }
+}
+
 sealed class HubcapLauncher
 {
     private readonly HttpClient _http;
     private readonly int _port;
     private readonly HubcapService _hubcap;
     private readonly ConcurrentDictionary<string, Task<ResolvedApp>> _resolvedApps = new();
+    private readonly ConcurrentDictionary<CdpSession, byte> _storeUiSessions = new();
+    private readonly ConcurrentDictionary<CdpSession, byte> _storePageSessions = new();
+    private readonly ConcurrentDictionary<CdpSession, byte> _steamShellSessions = new();
+    private readonly ConcurrentDictionary<CdpSession, byte> _sharedContextSessions = new();
     private readonly TaskCompletionSource _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly SemaphoreSlim _collectionSyncLock = new(1, 1);
+    private readonly SemaphoreSlim _settingsOpenLock = new(1, 1);
+    private int _lastCollectionSyncVersion = -1;
+    private DateTimeOffset _nextCollectionSyncRetryAt = DateTimeOffset.MinValue;
+    private int _topChromeMouseBridgeStarted;
+    private bool _topChromeMouseWasDown;
 
     public Task Ready => _ready.Task;
 
@@ -2515,6 +2934,7 @@ sealed class HubcapLauncher
 
     public async Task RunAsync()
     {
+        StartTopChromeMouseBridge();
         var running = new Dictionary<string, Task>();
         var waitingLogged = false;
         while (true)
@@ -2571,11 +2991,18 @@ sealed class HubcapLauncher
     private static bool IsAttachableTarget(CdpTarget target)
     {
         if (target.Type != "page" || string.IsNullOrWhiteSpace(target.WebSocketDebuggerUrl)) return false;
-        return IsStoreTarget(target) || IsSharedContextTarget(target);
+        return IsStoreUiTarget(target) || IsSharedContextTarget(target);
     }
 
     private static bool IsStoreTarget(CdpTarget target) =>
         target.Url.StartsWith("https://store.steampowered.com/", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsSteamShellTarget(CdpTarget target) =>
+        target.Title.Equals("Steam", StringComparison.OrdinalIgnoreCase) &&
+        target.Url.Contains("browserType=4", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsStoreUiTarget(CdpTarget target) =>
+        IsStoreTarget(target) || IsSteamShellTarget(target);
 
     private static bool IsLibraryTarget(CdpTarget target) =>
         target.Url.Contains("/library/app/", StringComparison.OrdinalIgnoreCase) ||
@@ -2595,28 +3022,140 @@ sealed class HubcapLauncher
     private async Task RunTargetAsync(CdpTarget target)
     {
         using var cdp = new CdpSession(target.WebSocketDebuggerUrl);
+        var isStoreUiTarget = IsStoreUiTarget(target);
+        var isStorePageTarget = IsStoreTarget(target);
+        var isSteamShellTarget = IsSteamShellTarget(target);
+        if (isStoreUiTarget)
+            _storeUiSessions[cdp] = 0;
+        if (isStorePageTarget)
+            _storePageSessions[cdp] = 0;
+        if (isSteamShellTarget)
+            _steamShellSessions[cdp] = 0;
+        if (IsSharedContextTarget(target))
+            _sharedContextSessions[cdp] = 0;
         cdp.BindingCalled += (_, payload) => _ = Task.Run(() => HandleEventAsync(cdp, payload));
-        await cdp.ConnectAsync();
-        await cdp.SendAsync("Runtime.enable");
-        await cdp.SendAsync("Runtime.addBinding", new { name = "hubcapNative" });
-
-        var inject = await cdp.EvaluateAsync(IsStoreTarget(target) ? Scripts.StoreUi : Scripts.SharedLibraryUi);
-        if (inject["exceptionDetails"] is not null)
-            throw new InvalidOperationException(inject["exceptionDetails"]!.ToJsonString());
-
-        var visibleAppId = IsStoreTarget(target) ? AppIdFromUrl(target.Url) : "";
-        if (!string.IsNullOrWhiteSpace(visibleAppId))
+        try
         {
-            await RefreshStateAsync(cdp, visibleAppId);
-        }
+            await cdp.ConnectAsync();
+            await cdp.SendAsync("Runtime.enable");
+            await cdp.SendAsync("Runtime.addBinding", new { name = "hubcapNative" });
 
-        Logger.Info(IsStoreTarget(target) ? "Attached to Steam Store." : "Attached to Steam Library context.");
-        _ready.TrySetResult();
-        if (IsStoreTarget(target))
-            _ = Task.Run(() => StoreWatchdogAsync(cdp));
-        else if (IsSharedContextTarget(target))
-            _ = Task.Run(() => SharedLibraryWatchdogAsync(cdp));
-        await cdp.ReceiveLoopTask;
+            var inject = await cdp.EvaluateAsync(isStoreUiTarget ? Scripts.StoreUi : Scripts.SharedLibraryUi);
+            if (inject["exceptionDetails"] is not null)
+                throw new InvalidOperationException(inject["exceptionDetails"]!.ToJsonString());
+
+            var visibleAppId = IsStoreTarget(target) ? AppIdFromUrl(target.Url) : "";
+            if (!string.IsNullOrWhiteSpace(visibleAppId))
+            {
+                await RefreshStateAsync(cdp, visibleAppId);
+            }
+
+            Logger.Info(isStoreUiTarget ? "Attached to Steam Store." : "Attached to Steam Library context.");
+            _ready.TrySetResult();
+            if (isSteamShellTarget)
+                _ = Task.Run(() => RefreshUsageOnlyAsync(cdp, forceRefresh: false));
+            if (isStoreUiTarget)
+                _ = Task.Run(() => StoreWatchdogAsync(cdp));
+            else if (IsSharedContextTarget(target))
+            {
+                await SyncLuaCollectionAsync(cdp, force: true);
+                _ = Task.Run(() => SharedLibraryWatchdogAsync(cdp));
+            }
+            await cdp.ReceiveLoopTask;
+        }
+        finally
+        {
+            if (isStoreUiTarget)
+                _storeUiSessions.TryRemove(cdp, out _);
+            if (isStorePageTarget)
+                _storePageSessions.TryRemove(cdp, out _);
+            if (isSteamShellTarget)
+                _steamShellSessions.TryRemove(cdp, out _);
+            if (IsSharedContextTarget(target))
+                _sharedContextSessions.TryRemove(cdp, out _);
+        }
+    }
+
+    private void StartTopChromeMouseBridge()
+    {
+        if (Interlocked.Exchange(ref _topChromeMouseBridgeStarted, 1) == 1)
+            return;
+
+        _ = Task.Run(TopChromeMouseBridgeAsync);
+    }
+
+    private async Task TopChromeMouseBridgeAsync()
+    {
+        while (SteamLauncher.IsSteamRunning())
+        {
+            try
+            {
+                if (MouseInput.TryGetCursor(out var cursor))
+                {
+                    var leftDown = MouseInput.IsLeftDown();
+                    var clicked = leftDown && !_topChromeMouseWasDown;
+                    _topChromeMouseWasDown = leftDown;
+
+                    if (_steamShellSessions.Count > 0)
+                    {
+                        var payload = JsonSerializer.Serialize(new
+                        {
+                            screenX = cursor.X,
+                            screenY = cursor.Y,
+                            leftDown,
+                            clicked
+                        }, JsonOptions.Default);
+
+                        foreach (var session in _steamShellSessions.Keys.ToList())
+                        {
+                            if (session.IsClosed) continue;
+                            try
+                            {
+                                var result = await session.EvaluateAsync($"window.__hubcapCdpTopStatsPointer && window.__hubcapCdpTopStatsPointer({payload})");
+                                if (TryReadHubcapTopControlResult(result, out _, out var action, out var anchorLeft, out var anchorTop, out var anchorClientLeft, out var anchorClientTop))
+                                {
+                                    if (action == "closeSettings")
+                                        await CloseSettingsPanelsAsync();
+                                    else if (action == "settings")
+                                        await OpenSettingsAsync(session, anchorLeft, anchorTop, anchorClientLeft, anchorClientTop);
+                                }
+                            }
+                            catch
+                            {
+                                // The shell target can disappear while Steam switches views.
+                            }
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Cursor forwarding should never interrupt the launcher.
+            }
+
+            await Task.Delay(50);
+        }
+    }
+
+    private static bool TryReadHubcapTopControlResult(JsonObject result, out bool overControls, out string action, out double? anchorLeft, out double? anchorTop, out double? anchorClientLeft, out double? anchorClientTop)
+    {
+        overControls = false;
+        action = "";
+        anchorLeft = null;
+        anchorTop = null;
+        anchorClientLeft = null;
+        anchorClientTop = null;
+        var value = result["result"]?["result"]?["value"]?.AsObject();
+        if (value is null) return false;
+        var overButton = value["overButton"]?.GetValue<bool?>() == true;
+        var overUsage = value["overUsage"]?.GetValue<bool?>() == true;
+        overControls = overButton || overUsage;
+        action = value["action"]?.GetValue<string?>() ?? "";
+        anchorLeft = value["settingsAnchorScreenLeft"]?.GetValue<double?>();
+        anchorTop = value["settingsAnchorScreenTop"]?.GetValue<double?>();
+        anchorClientLeft = value["settingsAnchorClientLeft"]?.GetValue<double?>();
+        anchorClientTop = value["settingsAnchorClientTop"]?.GetValue<double?>();
+        return true;
     }
 
     private async Task StoreWatchdogAsync(CdpSession cdp)
@@ -2636,17 +3175,20 @@ sealed class HubcapLauncher
 """);
                 var value = probe["result"]?["result"]?["value"]?.GetValue<string>() ?? "";
                 var state = JsonSerializer.Deserialize<StoreWatchdogState>(value, JsonOptions.Default);
-                if (!string.IsNullOrWhiteSpace(state?.AppId) && (!state.HasUi || !state.HasSetter))
+                if (state is not null && (!state.HasUi || !state.HasSetter))
                 {
                     var inject = await cdp.EvaluateAsync(Scripts.StoreUi);
                     if (inject["exceptionDetails"] is not null) continue;
                 }
 
                 var luaVersion = _hubcap.LuaVersion;
-                if (!string.IsNullOrWhiteSpace(state?.AppId) && (state.AppId != lastAppId || luaVersion != lastLuaVersion))
+                var luaChanged = luaVersion != lastLuaVersion;
+                if (luaChanged)
+                    lastLuaVersion = luaVersion;
+                await SyncLuaCollectionIfNeededAsync(cdp, luaChanged);
+                if (!string.IsNullOrWhiteSpace(state?.AppId) && (state.AppId != lastAppId || luaChanged))
                 {
                     lastAppId = state.AppId;
-                    lastLuaVersion = luaVersion;
                     await RefreshStateAsync(cdp, state.AppId);
                 }
             }
@@ -2673,10 +3215,13 @@ sealed class HubcapLauncher
 """);
                 var appId = probe["result"]?["result"]?["value"]?.GetValue<string>() ?? "";
                 var luaVersion = _hubcap.LuaVersion;
-                if (!string.IsNullOrWhiteSpace(appId) && (appId != lastAppId || luaVersion != lastLuaVersion))
+                var luaChanged = luaVersion != lastLuaVersion;
+                if (luaChanged)
+                    lastLuaVersion = luaVersion;
+                await SyncLuaCollectionIfNeededAsync(cdp, luaChanged);
+                if (!string.IsNullOrWhiteSpace(appId) && (appId != lastAppId || luaChanged))
                 {
                     lastAppId = appId;
-                    lastLuaVersion = luaVersion;
                     await RefreshLibraryStateAsync(cdp, appId);
                 }
             }
@@ -2690,6 +3235,207 @@ sealed class HubcapLauncher
         }
     }
 
+    private async Task SyncLuaCollectionIfNeededAsync(CdpSession cdp, bool luaChanged)
+    {
+        var luaVersion = _hubcap.LuaVersion;
+        if (!luaChanged && luaVersion == Volatile.Read(ref _lastCollectionSyncVersion))
+            return;
+        if (!luaChanged && DateTimeOffset.UtcNow < _nextCollectionSyncRetryAt)
+            return;
+
+        var sync = await SyncLuaCollectionAsync(cdp);
+        _nextCollectionSyncRetryAt = sync.Success ? DateTimeOffset.MinValue : DateTimeOffset.UtcNow.AddSeconds(3);
+    }
+
+    private async Task WaitForLuaAppReadyForCollectionAsync(CdpSession cdp, string appId)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(3);
+        var syncSession = CollectionSessionFor(cdp);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            var hasLocalLua = _hubcap.HasLua(appId, out _);
+            var visibleToSteam = await IsAppVisibleToSteamLibraryAsync(syncSession, appId);
+            if (hasLocalLua && visibleToSteam)
+            {
+                await Task.Delay(350);
+                return;
+            }
+
+            await Task.Delay(250);
+        }
+
+        Logger.Info($"Lua collection sync proceeding after wait: app {appId} may still be settling in Steam.");
+    }
+
+    private static async Task<bool> IsAppVisibleToSteamLibraryAsync(CdpSession cdp, string appId)
+    {
+        var appIdJson = JsonSerializer.Serialize(appId);
+        var result = await cdp.EvaluateAsync($$"""
+(() => {
+  const appId = Number.parseInt({{appIdJson}}, 10);
+  if (!Number.isInteger(appId) || appId <= 0) return false;
+  try {
+    return !!globalThis.appStore?.GetAppOverviewByAppID?.(appId);
+  } catch {
+    return false;
+  }
+})()
+""");
+        return result["result"]?["result"]?["value"]?.GetValue<bool?>() == true;
+    }
+
+    private async Task<ActionResult> SyncLuaCollectionAsync(CdpSession cdp, bool force = false)
+    {
+        if (!_hubcap.GetCollectionSyncEnabled())
+            return new ActionResult(true, "");
+
+        var luaVersion = _hubcap.LuaVersion;
+        if (!force && luaVersion == Volatile.Read(ref _lastCollectionSyncVersion))
+            return new ActionResult(true, "");
+
+        if (!await _collectionSyncLock.WaitAsync(TimeSpan.FromSeconds(1)))
+            return new ActionResult(false, "Collection sync is already running.");
+
+        try
+        {
+            luaVersion = _hubcap.LuaVersion;
+            if (!force && luaVersion == _lastCollectionSyncVersion)
+                return new ActionResult(true, "");
+
+            var appIds = _hubcap.GetLuaAppIds();
+            var collectionName = _hubcap.GetCollectionName();
+            if (string.IsNullOrWhiteSpace(collectionName))
+            {
+                Logger.Info("Lua collection sync skipped: no collection selected.");
+                return new ActionResult(false, "Choose a collection for Group Lua.");
+            }
+            if (appIds.Count == 0)
+            {
+                _lastCollectionSyncVersion = luaVersion;
+                Logger.Info($"Lua collection sync skipped: no Lua files found.");
+                return new ActionResult(true, "No Lua files found.");
+            }
+
+            var syncSession = CollectionSessionFor(cdp);
+            var sync = await syncSession.EvaluateAsync(Scripts.SyncLuaCollection(collectionName, appIds));
+            if (sync["exceptionDetails"] is not null)
+            {
+                var error = sync["exceptionDetails"]!.ToJsonString();
+                Logger.Info($"Lua collection sync failed: {error}");
+                return new ActionResult(false, error);
+            }
+
+            var resultJson = sync["result"]?["result"]?["value"]?.GetValue<string>() ?? "";
+            if (!string.IsNullOrWhiteSpace(resultJson))
+            {
+                try
+                {
+                    using var result = JsonDocument.Parse(resultJson);
+                    var root = result.RootElement;
+                    var ok = root.TryGetProperty("ok", out var okNode) && okNode.ValueKind == JsonValueKind.True;
+                    var name = root.TryGetProperty("collectionName", out var nameNode) ? nameNode.GetString() ?? collectionName : collectionName;
+                    var added = root.TryGetProperty("added", out var addedNode) && addedNode.TryGetInt32(out var addedValue) ? addedValue : 0;
+                    var total = root.TryGetProperty("totalLuaApps", out var totalNode) && totalNode.TryGetInt32(out var totalValue) ? totalValue : appIds.Count;
+                    var addable = root.TryGetProperty("addableLuaApps", out var addableNode) && addableNode.TryGetInt32(out var addableValue) ? addableValue : total;
+                    var removed = root.TryGetProperty("removed", out var removedNode) && removedNode.TryGetInt32(out var removedValue) ? removedValue : 0;
+                    if (ok)
+                    {
+                        if (addable < total)
+                        {
+                            var pending = total - addable;
+                            Logger.Info($"Lua collection sync pending: {pending} Lua game(s) are not visible to Steam yet.");
+                            return new ActionResult(false, $"{pending} Lua game(s) are not visible to Steam yet. Try again in a few seconds.");
+                        }
+                        if (added < addable)
+                        {
+                            var pending = addable - added;
+                            Logger.Info($"Lua collection sync pending: {pending} Lua game(s) were not added by Steam yet.");
+                            return new ActionResult(false, $"{pending} Lua game(s) were not added by Steam yet. Try again in a few seconds.");
+                        }
+                        _lastCollectionSyncVersion = luaVersion;
+                        Logger.Info($"Lua collection sync: {added}/{total} Lua games are in \"{name}\". Removed {removed} extras.");
+                        return new ActionResult(true, $"Grouped {added}/{total} Lua games in \"{name}\".");
+                    }
+                    else
+                    {
+                        var error = root.TryGetProperty("error", out var errorNode) ? errorNode.GetString() ?? "unknown error" : "unknown error";
+                        Logger.Info($"Lua collection sync failed: {error}");
+                        return new ActionResult(false, error);
+                    }
+                }
+                catch
+                {
+                    Logger.Info($"Lua collection sync returned: {resultJson}");
+                    return new ActionResult(false, resultJson);
+                }
+            }
+
+            return new ActionResult(false, "Steam collection sync returned no result.");
+        }
+        catch (Exception ex)
+        {
+            Logger.Info($"Lua collection sync failed: {ex.Message}");
+            return new ActionResult(false, ex.Message);
+        }
+        finally
+        {
+            _collectionSyncLock.Release();
+        }
+    }
+
+    private CdpSession CollectionSessionFor(CdpSession fallback)
+    {
+        foreach (var session in _sharedContextSessions.Keys.ToList())
+        {
+            if (!session.IsClosed)
+                return session;
+        }
+
+        return fallback;
+    }
+
+    private async Task<ActionResult> RemoveLuaCollectionAsync(CdpSession cdp, string collectionName)
+    {
+        collectionName = (collectionName ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(collectionName))
+            return new ActionResult(false, "Collection name is empty.");
+
+        try
+        {
+            var removeSession = CollectionSessionFor(cdp);
+            var remove = await removeSession.EvaluateAsync(Scripts.RemoveLuaCollection(collectionName));
+            if (remove["exceptionDetails"] is not null)
+            {
+                var exceptionJson = remove["exceptionDetails"]!.ToJsonString();
+                Logger.Info($"Lua collection remove failed: {exceptionJson}");
+                return new ActionResult(false, exceptionJson);
+            }
+
+            var resultJson = remove["result"]?["result"]?["value"]?.GetValue<string>() ?? "";
+            if (string.IsNullOrWhiteSpace(resultJson))
+                return new ActionResult(false, "Steam collection remove returned no result.");
+
+            using var result = JsonDocument.Parse(resultJson);
+            var root = result.RootElement;
+            var ok = root.TryGetProperty("ok", out var okNode) && okNode.ValueKind == JsonValueKind.True;
+            var name = root.TryGetProperty("collectionName", out var nameNode) ? nameNode.GetString() ?? collectionName : collectionName;
+            if (ok)
+            {
+                Logger.Info($"Lua collection removed: {name}");
+                return new ActionResult(true, "");
+            }
+
+            var error = root.TryGetProperty("error", out var errorNode) ? errorNode.GetString() ?? "unknown error" : "unknown error";
+            Logger.Info($"Lua collection remove failed: {error}");
+            return new ActionResult(false, error);
+        }
+        catch (Exception ex)
+        {
+            Logger.Info($"Lua collection remove failed: {ex.Message}");
+            return new ActionResult(false, ex.Message);
+        }
+    }
+
     private async Task HandleEventAsync(CdpSession cdp, string raw)
     {
         try
@@ -2699,15 +3445,27 @@ sealed class HubcapLauncher
 
             switch (evt.Action)
             {
+                case "toggleSettings":
+                    await ToggleSettingsAsync(cdp, evt.SettingsAnchorScreenLeft, evt.SettingsAnchorScreenTop, evt.SettingsAnchorClientLeft, evt.SettingsAnchorClientTop);
+                    return;
+
                 case "settings":
-                    await SetStateAsync(cdp, new UiState { SettingsOnly = true, Settings = _hubcap.GetSettings() });
+                    await OpenSettingsAsync(cdp, evt.SettingsAnchorScreenLeft, evt.SettingsAnchorScreenTop, evt.SettingsAnchorClientLeft, evt.SettingsAnchorClientTop);
+                    return;
+
+                case "closeSettings":
+                    await CloseSettingsPanelsAsync();
+                    return;
+
+                case "usage":
+                    await RefreshUsageOnlyAsync(cdp, forceRefresh: false);
                     return;
 
                 case "openLuaFolder":
                     var currentSettings = _hubcap.GetSettings();
                     var chosenFolder = _hubcap.ChooseLuaFolder();
                     var folderChanged = string.IsNullOrWhiteSpace(chosenFolder.Error) && chosenFolder.LuaDir != currentSettings.LuaDir;
-                    await SetStateAsync(cdp, new UiState
+                    var folderState = new UiState
                     {
                         SettingsOnly = true,
                         Settings = chosenFolder,
@@ -2715,20 +3473,30 @@ sealed class HubcapLauncher
                         StatusText = folderChanged ? "Folder selected. Save to apply." : chosenFolder.Error,
                         StatusTone = string.IsNullOrWhiteSpace(chosenFolder.Error) ? "idle" : "error",
                         StatusError = !string.IsNullOrWhiteSpace(chosenFolder.Error)
-                    });
+                    };
+                    await SetStateAsync(cdp, folderState);
+                    await BroadcastSettingsAsync(folderState, except: cdp);
                     return;
 
                 case "saveSettings":
-                    var savedSettings = _hubcap.SaveSettings(evt.LuaDir, evt.ApiKey);
-                    await SetStateAsync(cdp, new UiState
+                    var savedSettings = _hubcap.SaveSettings(evt.LuaDir, evt.ApiKey, evt.CollectionSyncEnabled, evt.CollectionName);
+                    ActionResult? syncResult = null;
+                    if (string.IsNullOrWhiteSpace(savedSettings.Error) && savedSettings.CollectionSyncEnabled)
+                        syncResult = await SyncLuaCollectionAsync(cdp, force: true);
+                    savedSettings.CollectionNames = await LoadCollectionNamesAsync(cdp, savedSettings.CollectionName, includeSelectedFallback: savedSettings.CollectionSyncEnabled && !string.IsNullOrWhiteSpace(savedSettings.CollectionName));
+                    var saveError = !string.IsNullOrWhiteSpace(savedSettings.Error);
+                    var syncError = syncResult is { Success: false };
+                    var savedState = new UiState
                     {
                         SettingsOnly = true,
                         Settings = savedSettings,
-                        SettingsDraft = !string.IsNullOrWhiteSpace(savedSettings.Error),
-                        StatusText = string.IsNullOrWhiteSpace(savedSettings.Error) ? "Saved." : savedSettings.Error,
-                        StatusTone = string.IsNullOrWhiteSpace(savedSettings.Error) ? "success" : "error",
-                        StatusError = !string.IsNullOrWhiteSpace(savedSettings.Error)
-                    });
+                        SettingsDraft = saveError || syncError,
+                        StatusText = saveError ? savedSettings.Error : syncError ? $"Saved, but Group Lua failed: {syncResult!.Error}" : savedSettings.CollectionSyncEnabled ? (syncResult?.Error is { Length: > 0 } ? $"Saved. {syncResult.Error}" : "Saved. Group Lua synced.") : "Saved.",
+                        StatusTone = saveError || syncError ? "error" : "success",
+                        StatusError = saveError || syncError
+                    };
+                    await SetStateAsync(cdp, savedState);
+                    await BroadcastSettingsAsync(savedState, except: cdp);
                     if (string.IsNullOrWhiteSpace(savedSettings.Error) &&
                         savedSettings.LuaDirChanged &&
                         UserPrompts.ConfirmRestartLauncherForLuaFolder())
@@ -2737,10 +3505,41 @@ sealed class HubcapLauncher
                     }
                     return;
 
+                case "removeCollection":
+                    var removeCollection = await RemoveLuaCollectionAsync(cdp, evt.CollectionName);
+                    var currentAfterRemove = _hubcap.GetSettings();
+                    if (removeCollection.Success && string.Equals(currentAfterRemove.CollectionName, evt.CollectionName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        currentAfterRemove = _hubcap.SaveSettings(currentAfterRemove.LuaDir, currentAfterRemove.ApiKey, false, "");
+                    }
+                    currentAfterRemove.CollectionNames = await LoadCollectionNamesAsync(cdp, removeCollection.Success ? "" : evt.CollectionName, includeSelectedFallback: !removeCollection.Success);
+                    if (removeCollection.Success && currentAfterRemove.CollectionNames.Count == 0)
+                        currentAfterRemove.CollectionName = "";
+                    var removeState = new UiState
+                    {
+                        SettingsOnly = true,
+                        Settings = currentAfterRemove,
+                        SettingsDraft = !removeCollection.Success,
+                        StatusText = removeCollection.Success ? $"Removed collection \"{evt.CollectionName}\"." : $"Remove failed: {removeCollection.Error}",
+                        StatusTone = removeCollection.Success ? "success" : "error",
+                        StatusError = !removeCollection.Success
+                    };
+                    await SetStateAsync(cdp, removeState);
+                    await BroadcastSettingsAsync(removeState, except: cdp);
+                    return;
+
                 case "copyApiKey":
                     var copyKey = _hubcap.CopyApiKeyToClipboard();
                     if (!copyKey.Success)
-                        await SetStateAsync(cdp, new UiState { SettingsOnly = true, Settings = _hubcap.GetSettings(), StatusText = copyKey.Error, StatusTone = "error", StatusError = true });
+                    {
+                        var copyState = new UiState { SettingsOnly = true, Settings = _hubcap.GetSettings(), StatusText = copyKey.Error, StatusTone = "error", StatusError = true };
+                        await SetStateAsync(cdp, copyState);
+                        await BroadcastSettingsAsync(copyState, except: cdp);
+                    }
+                    return;
+
+                case "refresh":
+                    await RefreshUsageOnlyAsync(cdp, forceRefresh: true);
                     return;
             }
 
@@ -2866,22 +3665,12 @@ sealed class HubcapLauncher
                     });
                     return;
 
-                case "openSteamDb":
-                    _hubcap.OpenSteamDb(evt.Url);
-                    return;
-
                 case "library":
                     SteamLauncher.OpenLibraryApp(appId);
                     return;
 
                 case "route":
                     await RefreshStateAsync(cdp, visibleAppId);
-                    return;
-
-                case "refresh":
-                    await SetStateAsync(cdp, new UiState { UsageOnly = true, UsageBusy = true });
-                    var usage = await _hubcap.GetUsageAsync(forceRefresh: true);
-                    await SetStateAsync(cdp, new UiState { UsageOnly = true, Usage = usage });
                     return;
 
                 case "download":
@@ -2892,7 +3681,18 @@ sealed class HubcapLauncher
                         StatusText = ""
                     });
                     var add = await _hubcap.DownloadAsync(appId);
-                    await RefreshStateAsync(cdp, visibleAppId, add.Success ? "Added!" : add.Error, add.Success ? "success" : "error", forceUsageRefresh: add.Success);
+                    ActionResult? downloadSync = null;
+                    if (add.Success && _hubcap.GetCollectionSyncEnabled())
+                    {
+                        await WaitForLuaAppReadyForCollectionAsync(cdp, appId);
+                        downloadSync = await SyncLuaCollectionAsync(cdp, force: true);
+                    }
+                    var downloadStatus = add.Success
+                        ? downloadSync is { Success: false }
+                            ? $"Added, but Group Lua failed: {downloadSync.Error}"
+                            : "Added!"
+                        : add.Error;
+                    await RefreshStateAsync(cdp, visibleAppId, downloadStatus, add.Success && downloadSync is not { Success: false } ? "success" : "error", forceUsageRefresh: add.Success);
                     return;
 
                 case "remove":
@@ -2903,6 +3703,8 @@ sealed class HubcapLauncher
                         StatusText = ""
                     });
                     var remove = await _hubcap.RemoveLuaAsync(appId);
+                    if (remove.Success && _hubcap.GetCollectionSyncEnabled())
+                        _ = await SyncLuaCollectionAsync(cdp, force: true);
                     await RefreshStateAsync(cdp, visibleAppId, remove.Success ? "" : remove.Error, remove.Success ? "success" : "error");
                     return;
             }
@@ -2930,11 +3732,218 @@ sealed class HubcapLauncher
             await SetStateAsync(cdp, new UiState { UsageOnly = true, UsageBusy = true });
             var usage = await _hubcap.GetUsageAsync(forceRefresh: forceUsageRefresh);
             await SetStateAsync(cdp, new UiState { UsageOnly = true, Usage = usage });
+            await BroadcastUsageAsync(usage, except: cdp);
         }
         catch (Exception ex)
         {
             await SetStateAsync(cdp, new UiState { UsageOnly = true, Usage = new UsageState { Error = ex.Message, ErrorLabel = "Stats Error" } });
         }
+    }
+
+    private async Task BroadcastUsageAsync(UsageState usage, CdpSession? except = null)
+    {
+        foreach (var session in _storeUiSessions.Keys.ToList())
+        {
+            if (ReferenceEquals(session, except) || session.IsClosed) continue;
+            try
+            {
+                await SetStateAsync(session, new UiState { UsageOnly = true, Usage = usage });
+            }
+            catch
+            {
+                // A closing Steam target should not block the active action.
+            }
+        }
+    }
+
+    private async Task RefreshUsageOnlyAsync(CdpSession cdp, bool forceRefresh)
+    {
+        if (cdp.IsClosed) return;
+        try
+        {
+            await SetStateAsync(cdp, new UiState { UsageOnly = true, UsageBusy = true });
+            var usage = await _hubcap.GetUsageAsync(forceRefresh: forceRefresh);
+            await SetStateAsync(cdp, new UiState { UsageOnly = true, Usage = usage });
+            await BroadcastUsageAsync(usage, except: cdp);
+        }
+        catch (Exception ex)
+        {
+            if (!cdp.IsClosed)
+                await SetStateAsync(cdp, new UiState { UsageOnly = true, Usage = new UsageState { Error = ex.Message, ErrorLabel = "Stats Error" } });
+        }
+    }
+
+    private async Task BroadcastSettingsAsync(UiState state, CdpSession? except = null)
+    {
+        foreach (var session in _storeUiSessions.Keys.ToList())
+        {
+            if (ReferenceEquals(session, except) || session.IsClosed) continue;
+            try
+            {
+                await SetStateAsync(session, state);
+            }
+            catch
+            {
+                // A closing Steam target should not block the active settings popup.
+            }
+        }
+    }
+
+    private async Task<bool> AnySettingsPanelOpenAsync()
+    {
+        foreach (var session in _storeUiSessions.Keys.ToList())
+        {
+            if (session.IsClosed) continue;
+            try
+            {
+                var probe = await session.EvaluateAsync("""
+(() => Array.from(document.querySelectorAll(".hp-settings")).some(panel => panel.dataset.visible === "true"))()
+""");
+                if (probe["result"]?["result"]?["value"]?.GetValue<bool?>() == true)
+                    return true;
+            }
+            catch
+            {
+                // A target can close while toggling settings.
+            }
+        }
+
+        return false;
+    }
+
+    private async Task CloseSettingsPanelsAsync()
+    {
+        foreach (var session in _storeUiSessions.Keys.ToList())
+        {
+            if (session.IsClosed) continue;
+            try
+            {
+                await session.EvaluateAsync("""
+(() => {
+  window.__hubcapSettingsGloballyVisible = "false";
+  window.__hubcapSettingsAnchor = null;
+  document.querySelectorAll(".hp-settings").forEach(panel => {
+    panel.dataset.visible = "false";
+    panel.style.removeProperty("display");
+  });
+})()
+""");
+            }
+            catch
+            {
+                // A target can close while toggling settings.
+            }
+        }
+    }
+
+    private async Task ToggleSettingsAsync(CdpSession source, double? anchorLeft = null, double? anchorTop = null, double? anchorClientLeft = null, double? anchorClientTop = null)
+    {
+        if (await AnySettingsPanelOpenAsync())
+        {
+            await CloseSettingsPanelsAsync();
+            return;
+        }
+
+        await OpenSettingsAsync(source, anchorLeft, anchorTop, anchorClientLeft, anchorClientTop);
+    }
+
+    private async Task OpenSettingsAsync(CdpSession source, double? anchorLeft = null, double? anchorTop = null, double? anchorClientLeft = null, double? anchorClientTop = null)
+    {
+        if (!await _settingsOpenLock.WaitAsync(TimeSpan.FromSeconds(1)))
+            return;
+
+        try
+        {
+            var settings = _hubcap.GetSettings();
+            settings.CollectionNames = string.IsNullOrWhiteSpace(settings.CollectionName) ? [] : [settings.CollectionName];
+            var initialState = new UiState
+            {
+                SettingsOnly = true,
+                Settings = settings,
+                SettingsAnchorScreenLeft = anchorLeft,
+                SettingsAnchorScreenTop = anchorTop,
+                SettingsAnchorClientLeft = anchorClientLeft,
+                SettingsAnchorClientTop = anchorClientTop
+            };
+            await SetStateAsync(source, initialState);
+            await BroadcastSettingsAsync(initialState, except: source);
+            try
+            {
+                settings = _hubcap.GetSettings();
+                settings.CollectionNames = await LoadCollectionNamesAsync(source, settings.CollectionName, includeSelectedFallback: !string.IsNullOrWhiteSpace(settings.CollectionName));
+                var state = new UiState
+                {
+                    SettingsOnly = true,
+                    Settings = settings,
+                    SettingsAnchorScreenLeft = anchorLeft,
+                    SettingsAnchorScreenTop = anchorTop,
+                    SettingsAnchorClientLeft = anchorClientLeft,
+                    SettingsAnchorClientTop = anchorClientTop
+                };
+                await SetStateAsync(source, state);
+                await BroadcastSettingsAsync(state, except: source);
+            }
+            catch (Exception ex)
+            {
+                Logger.Info($"Settings collection list skipped: {ex.Message}");
+            }
+        }
+        finally
+        {
+            _settingsOpenLock.Release();
+        }
+    }
+
+    private bool HasLiveStorePageSession() =>
+        _storePageSessions.Keys.Any(session => !session.IsClosed);
+
+    private async Task<List<string>> LoadCollectionNamesAsync(CdpSession source, string selectedName)
+    {
+        return await LoadCollectionNamesAsync(source, selectedName, includeSelectedFallback: true);
+    }
+
+    private async Task<List<string>> LoadCollectionNamesAsync(CdpSession source, string selectedName, bool includeSelectedFallback)
+    {
+        var names = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (includeSelectedFallback && !string.IsNullOrWhiteSpace(selectedName))
+            names.Add(selectedName);
+
+        foreach (var session in new[] { source }.Concat(_sharedContextSessions.Keys.ToList()))
+        {
+            if (session.IsClosed) continue;
+            try
+            {
+                var probe = await session.EvaluateAsync("""
+(() => {
+  const store = globalThis.collectionStore;
+  if (!store) return "";
+  const idOf = item => String(item?.m_strId || item?.id || "");
+  const nameOf = item => item?.displayName || item?.m_strName || item?.name || "";
+  const values = Array.isArray(store.userCollections) ? store.userCollections : [];
+  const names = values
+    .filter(item => idOf(item).startsWith("uc-"))
+    .map(nameOf)
+    .filter(Boolean);
+  return JSON.stringify(Array.from(new Set(names)).sort((a,b)=>a.localeCompare(b)));
+})()
+""");
+                var value = probe["result"]?["result"]?["value"]?.GetValue<string>() ?? "";
+                if (string.IsNullOrWhiteSpace(value)) continue;
+                foreach (var name in JsonSerializer.Deserialize<List<string>>(value, JsonOptions.Default) ?? [])
+                {
+                    if (!string.IsNullOrWhiteSpace(name))
+                        names.Add(name.Trim());
+                }
+                if (names.Count > 1)
+                    break;
+            }
+            catch
+            {
+                // Steam's collection store is only available after Library initializes.
+            }
+        }
+
+        return names.ToList();
     }
 
     private async Task RefreshLibraryStateAsync(CdpSession cdp, string visibleAppId)
@@ -3067,6 +4076,28 @@ sealed class HubcapService
             try { EnsureLuaCache(); } catch { }
             return Volatile.Read(ref _luaVersion);
         }
+    }
+
+    public IReadOnlyList<string> GetLuaAppIds()
+    {
+        EnsureLuaCache();
+        lock (_cacheLock)
+            return _luaAppIds
+                .Where(appId => Regex.IsMatch(appId, @"^\d+$"))
+                .OrderBy(appId => long.TryParse(appId, out var numeric) ? numeric : long.MaxValue)
+                .ToList();
+    }
+
+    public string GetCollectionName()
+    {
+        var config = EnsureLuaCache();
+        return config.CollectionName.Trim();
+    }
+
+    public bool GetCollectionSyncEnabled()
+    {
+        var config = EnsureLuaCache();
+        return config.CollectionSyncEnabled;
     }
 
     public async Task<UiState> GetStateAsync(ResolvedApp app)
@@ -3304,53 +4335,6 @@ sealed class HubcapService
         }
     }
 
-    public async Task<LuaVersionState> GetLuaVersionAsync(string appId, string gameName = "")
-    {
-        try
-        {
-            var config = EnsureLuaCache();
-            var luaPath = Path.Combine(config.LuaDir, $"{appId}.lua");
-            if (!File.Exists(luaPath))
-                return LuaVersionState.Error(appId, "", "", "Lua file no longer exists.", gameName);
-
-            var entries = ReadLuaManifestEntries(luaPath);
-            var depotId = MainDepotId(appId);
-            var current = SelectLuaVersionEntry(entries, appId);
-            if (current is null)
-                return LuaVersionState.Error(appId, depotId, "", "No active Windows base depot manifest found in this Lua.", gameName);
-
-            depotId = current.DepotId;
-            var state = LuaVersionState.ForCurrent(appId, depotId, current.ManifestId, gameName);
-            try
-            {
-                state.Options = await GetSteamDbManifestOptionsAsync(depotId, current.ManifestId);
-                var currentOption = state.Options.FirstOrDefault(option => string.Equals(option.ManifestId, current.ManifestId, StringComparison.OrdinalIgnoreCase));
-                if (currentOption is not null) state.CurrentDate = currentOption.Date;
-                state.StatusText = state.Options.Count > 1
-                    ? ""
-                    : "SteamDB did not return older manifests for this depot.";
-            }
-            catch (Exception ex)
-            {
-                state.Options = [new LuaManifestOptionState
-                {
-                    ManifestId = current.ManifestId,
-                    Date = "",
-                    Label = $"{current.ManifestId} (current)",
-                    IsCurrent = true
-                }];
-                state.StatusText = $"SteamDB manifest list unavailable: {ex.Message}";
-                state.StatusTone = "error";
-            }
-
-            return state;
-        }
-        catch (Exception ex)
-        {
-            return LuaVersionState.Error(appId, MainDepotId(appId), "", ex.Message, gameName);
-        }
-    }
-
     public LuaVersionState GetLuaVersionCurrentOnly(string appId, string gameName = "")
     {
         try
@@ -3364,7 +4348,7 @@ sealed class HubcapService
             var depotId = MainDepotId(appId);
             var current = SelectLuaVersionEntry(entries, appId);
             if (current is null)
-                return LuaVersionState.Error(appId, depotId, "", "No active Windows base depot manifest found in this Lua.", gameName);
+                return LuaVersionState.Error(appId, depotId, "", $"No active manifest found for depot {depotId} in this Lua.", gameName);
 
             return LuaVersionState.ForCurrent(appId, current.DepotId, current.ManifestId, gameName);
         }
@@ -3374,14 +4358,14 @@ sealed class HubcapService
         }
     }
 
-    public async Task<LuaVersionState> GetLuaVersionWithBrowserAsync(string appId, string gameName = "")
+    public Task<LuaVersionState> GetLuaVersionWithBrowserAsync(string appId, string gameName = "")
     {
-        var state = await GetLuaVersionAsync(appId, gameName);
+        var state = GetLuaVersionCurrentOnly(appId, gameName);
         if (string.IsNullOrWhiteSpace(state.DepotId) || string.IsNullOrWhiteSpace(state.CurrentManifestId))
         {
             state.StatusText = string.IsNullOrWhiteSpace(state.StatusText) ? "No current Lua manifest to match against." : state.StatusText;
             state.StatusTone = "error";
-            return state;
+            return Task.FromResult(state);
         }
 
         try
@@ -3391,7 +4375,7 @@ sealed class HubcapService
             {
                 state.StatusText = "No manifest rows were readable from the SteamDB window.";
                 state.StatusTone = "error";
-                return state;
+                return Task.FromResult(state);
             }
 
             state.Options = options;
@@ -3404,13 +4388,13 @@ sealed class HubcapService
                 ? $"Loaded {options.Count} versions from SteamDB."
                 : $"Loaded {options.Count} ManifestIDs. BuildIDs were not available on SteamDB for this app.";
             state.StatusTone = "success";
-            return state;
+            return Task.FromResult(state);
         }
         catch (Exception ex)
         {
             state.StatusText = $"SteamDB browser picker failed: {ex.Message}";
             state.StatusTone = "error";
-            return state;
+            return Task.FromResult(state);
         }
     }
 
@@ -3430,7 +4414,7 @@ sealed class HubcapService
             var entries = ReadLuaManifestEntries(luaPath);
             var target = SelectLuaVersionEntry(entries, appId);
             if (target is null)
-                return new ActionResult(false, "No active Windows base depot manifest found in this Lua.");
+                return new ActionResult(false, $"No active manifest found for depot {MainDepotId(appId)} in this Lua.");
             if (string.Equals(target.ManifestId, manifestId, StringComparison.OrdinalIgnoreCase))
                 return new ActionResult(false, "That ManifestID is already selected.");
 
@@ -3456,33 +4440,15 @@ sealed class HubcapService
         }
     }
 
-    public ActionResult OpenSteamDb(string url)
-    {
-        try
-        {
-            if (string.IsNullOrWhiteSpace(url) ||
-                !Uri.TryCreate(url, UriKind.Absolute, out var uri) ||
-                !string.Equals(uri.Host, "steamdb.info", StringComparison.OrdinalIgnoreCase))
-                return new ActionResult(false, "Invalid SteamDB URL.");
-
-            Process.Start(new ProcessStartInfo(uri.ToString()) { UseShellExecute = true });
-            return new ActionResult(true, "");
-        }
-        catch (Exception ex)
-        {
-            return new ActionResult(false, ex.Message);
-        }
-    }
-
     public SettingsState GetSettings()
     {
         try
         {
-            var configPath = GetConfigPath();
-            if (!File.Exists(configPath))
-                return MissingConfigSettings(configPath);
+            var source = ResolveConfigSource();
+            if (!File.Exists(source.Path))
+                return MissingConfigSettings(source.Path);
 
-            return ReadSettings(configPath);
+            return ReadSettings(source);
         }
         catch (Exception ex)
         {
@@ -3507,7 +4473,9 @@ sealed class HubcapService
             return new SettingsState
             {
                 LuaDir = ToConfigPath(NormalizeBackslashes(selected)),
-                ApiKey = settings.ApiKey
+                ApiKey = settings.ApiKey,
+                CollectionName = settings.CollectionName,
+                CollectionSyncEnabled = settings.CollectionSyncEnabled
             };
         }
         catch (Exception ex)
@@ -3518,52 +4486,38 @@ sealed class HubcapService
         }
     }
 
-    public SettingsState SaveSettings(string luaDir, string apiKey)
+    public SettingsState SaveSettings(string luaDir, string apiKey, bool collectionSyncEnabled, string collectionName)
     {
         var luaDirChanged = false;
         try
         {
-            var configPath = GetConfigPath();
-            if (!File.Exists(configPath))
+            var source = ResolveConfigSource();
+            if (!File.Exists(source.Path))
                 throw new InvalidOperationException(ConfigMissingMessage);
 
-            var previousSettings = ReadSettings(configPath);
+            var previousSettings = ReadSettings(source);
             var previousLuaDir = NormalizeBackslashes(previousSettings.LuaDir);
 
             luaDir = NormalizeBackslashes(Environment.ExpandEnvironmentVariables((luaDir ?? "").Trim()));
             apiKey = (apiKey ?? "").Trim();
+            collectionName = (collectionName ?? "").Trim();
             var luaDirWasBlank = string.IsNullOrWhiteSpace(luaDir);
             if (luaDirWasBlank)
                 luaDir = DefaultLuaDir();
+            if (!collectionSyncEnabled)
+                collectionName = "";
+            if (collectionSyncEnabled && string.IsNullOrWhiteSpace(collectionName))
+                throw new InvalidOperationException("Choose a collection for Group Lua.");
             if (string.IsNullOrWhiteSpace(apiKey))
                 throw new InvalidOperationException("API key is required.");
             if (!luaDirWasBlank && !Directory.Exists(luaDir))
                 throw new InvalidOperationException("Lua folder does not exist.");
             luaDirChanged = !string.Equals(previousLuaDir, luaDir, StringComparison.OrdinalIgnoreCase);
 
-            var lines = File.Exists(configPath) ? File.ReadAllLines(configPath).ToList() : [];
-            var updatedLuaDir = false;
-            var updatedApiKey = false;
-            for (var i = 0; i < lines.Count; i++)
-            {
-                var parts = lines[i].Split(':', 2);
-                if (parts.Length != 2) continue;
-                var key = parts[0].Trim();
-                if (key == "HubcapLuaDir")
-                {
-                    lines[i] = $"HubcapLuaDir: {QuoteConfigValue(ToConfigPath(luaDir))}";
-                    updatedLuaDir = true;
-                }
-                else if (key == "HubcapApiKey")
-                {
-                    lines[i] = $"HubcapApiKey: {QuoteConfigValue(apiKey)}";
-                    updatedApiKey = true;
-                }
-            }
-
-            if (!updatedApiKey) lines.Add($"HubcapApiKey: {QuoteConfigValue(apiKey)}");
-            if (!updatedLuaDir) lines.Add($"HubcapLuaDir: {QuoteConfigValue(ToConfigPath(luaDir))}");
-            File.WriteAllLines(configPath, lines);
+            var apiKeyChanged = !string.Equals(previousSettings.ApiKey, apiKey, StringComparison.Ordinal);
+            if (luaDirChanged || apiKeyChanged)
+                WriteSettings(source, luaDir, apiKey);
+            WriteLauncherSettings(collectionSyncEnabled, collectionName);
 
             lock (_cacheLock)
             {
@@ -3582,6 +4536,8 @@ sealed class HubcapService
             var settings = GetSettings();
             settings.LuaDir = ToConfigPath(NormalizeBackslashes(luaDir ?? settings.LuaDir));
             settings.ApiKey = apiKey ?? settings.ApiKey;
+            settings.CollectionSyncEnabled = collectionSyncEnabled;
+            settings.CollectionName = collectionSyncEnabled ? collectionName : "";
             settings.Error = ex.Message;
             settings.LuaDirChanged = false;
             return settings;
@@ -3614,66 +4570,20 @@ sealed class HubcapService
         }
     }
 
-    private async Task<List<LuaManifestOptionState>> GetSteamDbManifestOptionsAsync(string depotId, string currentManifestId)
-    {
-        var url = $"https://steamdb.info/depot/{Uri.EscapeDataString(depotId)}/manifests/";
-        using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36");
-        request.Headers.Accept.ParseAdd("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
-        request.Headers.Referrer = new Uri("https://steamdb.info/");
-        using var response = await _http.SendAsync(request);
-        if (!response.IsSuccessStatusCode)
-            throw new InvalidOperationException($"SteamDB returned {(int)response.StatusCode}.");
-
-        var html = await response.Content.ReadAsStringAsync();
-        var options = ParseSteamDbManifestOptions(html, currentManifestId);
-        if (options.Count == 0)
-            throw new InvalidOperationException("no manifests found on SteamDB.");
-        return options;
-    }
-
     private static List<LuaManifestEntry> ReadLuaManifestEntries(string luaPath)
     {
         var entries = new List<LuaManifestEntry>();
-        var depotMeta = new Dictionary<string, LuaDepotMeta>(StringComparer.OrdinalIgnoreCase);
-        var section = LuaDepotSection.Unknown;
 
         foreach (var line in File.ReadLines(luaPath))
         {
-            var trimmed = line.TrimStart();
-            if (trimmed.StartsWith("--", StringComparison.Ordinal))
-            {
-                section = NextLuaDepotSection(section, trimmed);
-                continue;
-            }
-
-            var addMatch = Regex.Match(line, @"^\s*addappid\s*\(\s*(?<depot>\d+)[^)]*\)\s*(?:--\s*(?<comment>.*))?$", RegexOptions.IgnoreCase);
-            if (addMatch.Success)
-            {
-                var depotId = addMatch.Groups["depot"].Value;
-                var comment = addMatch.Groups["comment"].Value.Trim();
-                depotMeta[depotId] = LuaDepotMeta.From(section, comment);
-                continue;
-            }
-
             var manifestMatch = Regex.Match(line, @"^\s*setManifestid\s*\(\s*(?<depot>\d+)\s*,\s*[""'](?<manifest>\d+)[""']\s*(?:,\s*(?<size>\d+))?\s*\)", RegexOptions.IgnoreCase);
             if (!manifestMatch.Success) continue;
 
-            var manifestDepotId = manifestMatch.Groups["depot"].Value;
-            if (!depotMeta.TryGetValue(manifestDepotId, out var meta))
-                meta = LuaDepotMeta.From(section, "");
             entries.Add(new LuaManifestEntry
             {
-                DepotId = manifestDepotId,
+                DepotId = manifestMatch.Groups["depot"].Value,
                 ManifestId = manifestMatch.Groups["manifest"].Value,
-                Size = manifestMatch.Groups["size"].Value,
-                Comment = meta.Comment,
-                Section = meta.Section,
-                IsWindows = meta.IsWindows,
-                IsNonWindows = meta.IsNonWindows,
-                IsBase = meta.IsBase,
-                IsDlc = meta.IsDlc,
-                IsShared = meta.IsShared
+                Size = manifestMatch.Groups["size"].Value
             });
         }
 
@@ -3682,97 +4592,8 @@ sealed class HubcapService
 
     private static LuaManifestEntry? SelectLuaVersionEntry(List<LuaManifestEntry> entries, string appId)
     {
-        var active = entries
-            .Where(entry => !entry.IsShared && !entry.IsDlc && !entry.IsNonWindows)
-            .ToList();
         var mainDepotId = MainDepotId(appId);
-
-        var explicitWindowsBase = active
-            .Where(entry => entry.IsBase && entry.IsWindows)
-            .ToList();
-        var current = explicitWindowsBase.FirstOrDefault(entry => string.Equals(entry.DepotId, mainDepotId, StringComparison.OrdinalIgnoreCase))
-            ?? explicitWindowsBase.FirstOrDefault();
-        if (current is not null) return current;
-
-        var inferredBase = active.Where(entry => entry.IsBase).ToList();
-        current = inferredBase.FirstOrDefault(entry => string.Equals(entry.DepotId, mainDepotId, StringComparison.OrdinalIgnoreCase));
-        if (current is not null) return current;
-        if (inferredBase.Count == 1) return inferredBase[0];
-
-        current = active.FirstOrDefault(entry => string.Equals(entry.DepotId, mainDepotId, StringComparison.OrdinalIgnoreCase));
-        if (current is not null) return current;
-        return active.Count == 1 ? active[0] : null;
-    }
-
-    private static LuaDepotSection NextLuaDepotSection(LuaDepotSection current, string commentLine)
-    {
-        var text = commentLine.TrimStart('-').Trim();
-        if (text.Contains("MAIN APP DEPOTS", StringComparison.OrdinalIgnoreCase)) return LuaDepotSection.Base;
-        if (text.Contains("DLCS WITH DEDICATED DEPOTS", StringComparison.OrdinalIgnoreCase)) return LuaDepotSection.Dlc;
-        if (text.Contains("SHARED DEPOTS", StringComparison.OrdinalIgnoreCase) ||
-            text.Contains("REDISTRIBUTABLES", StringComparison.OrdinalIgnoreCase)) return LuaDepotSection.Shared;
-        if (text.Contains("EMPTY DEPOTS", StringComparison.OrdinalIgnoreCase)) return LuaDepotSection.Empty;
-        if (text.Contains("MAIN APPLICATION", StringComparison.OrdinalIgnoreCase)) return LuaDepotSection.MainApplication;
-        return current;
-    }
-
-    private static List<LuaManifestOptionState> ParseSteamDbManifestOptions(string html, string currentManifestId)
-    {
-        var text = WebUtility.HtmlDecode(Regex.Replace(html, "<[^>]+>", "\n"));
-        text = Regex.Replace(text, @"[ \t\r\f\v]+", " ");
-        text = Regex.Replace(text, @"\n\s+", "\n");
-
-        var options = new Dictionary<string, LuaManifestOptionState>(StringComparer.OrdinalIgnoreCase);
-        var displayMatch = Regex.Match(
-            text,
-            @"Displaying manifest\s+(?<manifest>\d{12,20})\s+dated\s+(?<date>\d{1,2}\s+[A-Za-z]+\s+\d{4}\s+\p{Pd}\s+\d{2}:\d{2}:\d{2}\s+UTC)",
-            RegexOptions.IgnoreCase);
-        if (displayMatch.Success)
-            AddSteamDbOption(options, displayMatch.Groups["manifest"].Value, displayMatch.Groups["date"].Value, currentManifestId);
-
-        var sectionStart = text.IndexOf("Previously seen manifests", StringComparison.OrdinalIgnoreCase);
-        if (sectionStart >= 0)
-        {
-            var section = text[sectionStart..];
-            var historyStart = section.IndexOf("\n##", StringComparison.OrdinalIgnoreCase);
-            if (historyStart > 0) section = section[..historyStart];
-
-            foreach (Match match in Regex.Matches(
-                section,
-                @"(?<date>\d{1,2}\s+[A-Za-z]+\s+\d{4}\s+\p{Pd}\s+\d{2}:\d{2}:\d{2}\s+UTC)\s+(?<manifest>\d{12,20})",
-                RegexOptions.IgnoreCase))
-            {
-                AddSteamDbOption(options, match.Groups["manifest"].Value, match.Groups["date"].Value, currentManifestId);
-            }
-        }
-
-        if (!string.IsNullOrWhiteSpace(currentManifestId) && !options.ContainsKey(currentManifestId))
-            AddSteamDbOption(options, currentManifestId, "", currentManifestId);
-
-        return options.Values
-            .OrderByDescending(option => ParseSteamDbDate(option.Date))
-            .ThenByDescending(option => option.IsCurrent)
-            .ToList();
-    }
-
-    private static void AddSteamDbOption(Dictionary<string, LuaManifestOptionState> options, string manifestId, string date, string currentManifestId)
-    {
-        if (string.IsNullOrWhiteSpace(manifestId)) return;
-        var isCurrent = string.Equals(manifestId, currentManifestId, StringComparison.OrdinalIgnoreCase);
-        options[manifestId] = new LuaManifestOptionState
-        {
-            ManifestId = manifestId,
-            Date = date,
-            Label = string.IsNullOrWhiteSpace(date) ? $"{manifestId}{(isCurrent ? " (current)" : "")}" : $"{manifestId} - {date}{(isCurrent ? " (current)" : "")}",
-            IsCurrent = isCurrent
-        };
-    }
-
-    private static DateTimeOffset ParseSteamDbDate(string value)
-    {
-        if (string.IsNullOrWhiteSpace(value)) return DateTimeOffset.MinValue;
-        var normalized = value.Replace("–", "-", StringComparison.Ordinal).Replace("—", "-", StringComparison.Ordinal);
-        return DateTimeOffset.TryParse(normalized, out var parsed) ? parsed : DateTimeOffset.MinValue;
+        return entries.FirstOrDefault(entry => string.Equals(entry.DepotId, mainDepotId, StringComparison.OrdinalIgnoreCase));
     }
 
     private static string MainDepotId(string appId) =>
@@ -3787,7 +4608,7 @@ sealed class HubcapService
         }
 
         var config = ReadConfig();
-        var configKey = $"{config.ApiKey}\n{config.LuaDir}";
+        var configKey = $"{config.ApiKey}\n{config.LuaDir}\n{config.CollectionSyncEnabled}\n{config.CollectionName}";
 
         lock (_cacheLock)
         {
@@ -3868,10 +4689,46 @@ sealed class HubcapService
 
     private static HubcapConfig ReadConfig()
     {
-        var configPath = GetConfigPath();
-        if (!File.Exists(configPath))
+        var source = ResolveConfigSource();
+        if (!File.Exists(source.Path))
             throw new InvalidOperationException(ConfigMissingMessage);
 
+        var config = source.Kind == ConfigSourceKind.ManifestJson
+            ? ReadJsonConfig(source.Path)
+            : ReadYamlConfig(source.Path);
+        var launcherSettings = ReadLauncherSettings();
+        return config with
+        {
+            CollectionName = launcherSettings.CollectionSyncEnabled ? launcherSettings.CollectionName : "",
+            CollectionSyncEnabled = launcherSettings.CollectionSyncEnabled
+        };
+    }
+
+    private static SettingsState ReadSettings(ConfigSource source)
+    {
+        var config = source.Kind == ConfigSourceKind.ManifestJson
+            ? ReadJsonConfig(source.Path)
+            : ReadYamlConfig(source.Path);
+        var launcherSettings = ReadLauncherSettings();
+        config = config with
+        {
+            CollectionName = launcherSettings.CollectionSyncEnabled ? launcherSettings.CollectionName : "",
+            CollectionSyncEnabled = launcherSettings.CollectionSyncEnabled
+        };
+
+        return new SettingsState
+        {
+            LuaDir = ToConfigPath(config.LuaDir),
+            ApiKey = config.ApiKey,
+            CollectionName = config.CollectionSyncEnabled ? config.CollectionName : "",
+            CollectionSyncEnabled = config.CollectionSyncEnabled,
+            ConfigPath = DisplayPath(source.Path),
+            Error = string.IsNullOrWhiteSpace(config.ApiKey) ? "API Key missing." : ""
+        };
+    }
+
+    private static HubcapConfig ReadYamlConfig(string configPath)
+    {
         string apiKey = "";
         string luaDir = "";
         foreach (var line in File.ReadLines(configPath))
@@ -3886,37 +4743,122 @@ sealed class HubcapService
 
         if (string.IsNullOrWhiteSpace(apiKey)) throw new InvalidOperationException("API Key missing.");
         if (string.IsNullOrWhiteSpace(luaDir)) luaDir = DefaultLuaDir();
-        return new HubcapConfig(apiKey, luaDir);
+        return new HubcapConfig(apiKey, luaDir, "", false);
     }
 
-    private static SettingsState ReadSettings(string configPath)
+    private static HubcapConfig ReadJsonConfig(string configPath)
     {
-        string apiKey = "";
-        string luaDir = "";
-        foreach (var line in File.ReadLines(configPath))
+        using var doc = JsonDocument.Parse(File.ReadAllText(configPath));
+        var root = doc.RootElement;
+        var apiKey = JsonString(root, "ApiKey");
+        var luaDir = NormalizeBackslashes(Environment.ExpandEnvironmentVariables(
+            JsonString(root, "HubcapToolsLuaPath") ??
+            JsonString(root, "SteamToolsLuaPath") ??
+            ""));
+        if (string.IsNullOrWhiteSpace(apiKey)) throw new InvalidOperationException("API Key missing.");
+        if (string.IsNullOrWhiteSpace(luaDir)) luaDir = DefaultLuaDir();
+        return new HubcapConfig(apiKey, luaDir, "", false);
+    }
+
+    private static LauncherSettings ReadLauncherSettings()
+    {
+        try
         {
-            var parts = line.Split(':', 2);
-            if (parts.Length != 2) continue;
-            var key = parts[0].Trim();
-            var value = Unquote(parts[1].Trim());
-            if (key == "HubcapApiKey") apiKey = value;
-            if (key == "HubcapLuaDir") luaDir = NormalizeBackslashes(Environment.ExpandEnvironmentVariables(value));
+            var path = GetLauncherSettingsPath();
+            if (!File.Exists(path))
+                return new LauncherSettings();
+
+            using var doc = JsonDocument.Parse(File.ReadAllText(path));
+            var root = doc.RootElement;
+            var collectionSyncEnabled = JsonBool(root, "CollectionSyncEnabled");
+            var collectionName = JsonString(root, "CollectionName")?.Trim() ?? "";
+            if (!collectionSyncEnabled)
+                collectionName = "";
+            return new LauncherSettings(collectionSyncEnabled, collectionName);
+        }
+        catch (Exception ex)
+        {
+            Logger.Info($"Launcher settings unavailable: {ex.Message}");
+            return new LauncherSettings();
+        }
+    }
+
+    private static void WriteLauncherSettings(bool collectionSyncEnabled, string collectionName)
+    {
+        collectionName = collectionSyncEnabled ? (collectionName ?? "").Trim() : "";
+        var path = GetLauncherSettingsPath();
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var node = new JsonObject
+        {
+            ["CollectionSyncEnabled"] = collectionSyncEnabled,
+            ["CollectionName"] = collectionName
+        };
+        File.WriteAllText(path, node.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    private static void WriteSettings(ConfigSource source, string luaDir, string apiKey)
+    {
+        if (source.Kind == ConfigSourceKind.ManifestJson)
+        {
+            var node = JsonNode.Parse(File.ReadAllText(source.Path))?.AsObject() ?? [];
+            node["ApiKey"] = apiKey;
+            node["HubcapToolsLuaPath"] = luaDir;
+            File.WriteAllText(source.Path, node.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+            return;
         }
 
-        if (string.IsNullOrWhiteSpace(luaDir)) luaDir = DefaultLuaDir();
-        return new SettingsState
+        var lines = File.Exists(source.Path) ? File.ReadAllLines(source.Path).ToList() : [];
+        var updatedLuaDir = false;
+        var updatedApiKey = false;
+        for (var i = 0; i < lines.Count; i++)
         {
-            LuaDir = ToConfigPath(luaDir),
-            ApiKey = apiKey,
-            Error = string.IsNullOrWhiteSpace(apiKey) ? "API Key missing." : ""
-        };
+            var parts = lines[i].Split(':', 2);
+            if (parts.Length != 2) continue;
+            var key = parts[0].Trim();
+            if (key == "HubcapLuaDir")
+            {
+                lines[i] = $"HubcapLuaDir: {QuoteConfigValue(ToConfigPath(luaDir))}";
+                updatedLuaDir = true;
+            }
+            else if (key == "HubcapApiKey")
+            {
+                lines[i] = $"HubcapApiKey: {QuoteConfigValue(apiKey)}";
+                updatedApiKey = true;
+            }
+        }
+
+        if (!updatedApiKey) lines.Add($"HubcapApiKey: {QuoteConfigValue(apiKey)}");
+        if (!updatedLuaDir) lines.Add($"HubcapLuaDir: {QuoteConfigValue(ToConfigPath(luaDir))}");
+        Directory.CreateDirectory(Path.GetDirectoryName(source.Path)!);
+        File.WriteAllLines(source.Path, lines);
     }
+
+    private static bool ParseConfigBool(string value) =>
+        value.Trim().Equals("true", StringComparison.OrdinalIgnoreCase) ||
+        value.Trim().Equals("yes", StringComparison.OrdinalIgnoreCase) ||
+        value.Trim().Equals("1", StringComparison.OrdinalIgnoreCase) ||
+        value.Trim().Equals("on", StringComparison.OrdinalIgnoreCase);
 
     private static string GetConfigPath()
     {
         var steamRoot = FindSteamRoot();
         return Path.Combine(steamRoot, "config", "hubcaptools", "config.yaml");
     }
+
+    private static string GetLauncherSettingsPath() =>
+        Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "HubcapLauncher",
+            "settings.json");
+
+    private static ConfigSource ResolveConfigSource()
+    {
+        var yamlPath = GetConfigPath();
+        return new ConfigSource(yamlPath, ConfigSourceKind.Yaml);
+    }
+
+    private static string GetManifestSettingsPath() =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "HubcapManifestApp", "settings.json");
 
     private static string DefaultLuaDir() => Path.Combine(FindSteamRoot(), "config", "hubcap-lua");
 
@@ -3958,6 +4900,26 @@ sealed class HubcapService
     }
 
     private static string DisplayPath(string path) => ToConfigPath(path);
+
+    private static string JsonString(JsonElement element, string propertyName) =>
+        element.TryGetProperty(propertyName, out var property) && property.ValueKind == JsonValueKind.String
+            ? property.GetString() ?? ""
+            : "";
+
+    private static string JsonString(JsonObject node, string propertyName) =>
+        node.TryGetPropertyValue(propertyName, out var value) && value is not null
+            ? value.GetValue<string?>() ?? ""
+            : "";
+
+    private static bool JsonBool(JsonElement element, string propertyName) =>
+        element.TryGetProperty(propertyName, out var property) && property.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            JsonValueKind.String => ParseConfigBool(property.GetString() ?? ""),
+            JsonValueKind.Number => property.TryGetInt32(out var value) && value != 0,
+            _ => false
+        };
 
     private static string NormalizeBackslashes(string value)
     {
@@ -4068,6 +5030,7 @@ sealed class CdpSession : IDisposable
 {
     private readonly ClientWebSocket _socket = new();
     private readonly ConcurrentDictionary<int, TaskCompletionSource<JsonObject>> _pending = new();
+    private readonly SemaphoreSlim _sendLock = new(1, 1);
     private int _nextId = 1;
 
     public CdpSession(string websocketUrl) => WebsocketUrl = websocketUrl;
@@ -4095,7 +5058,15 @@ sealed class CdpSession : IDisposable
             ["params"] = parameters is null ? new JsonObject() : JsonSerializer.SerializeToNode(parameters, JsonOptions.Default)
         };
         var bytes = Encoding.UTF8.GetBytes(payload.ToJsonString(JsonOptions.Default));
-        await _socket.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
+        await _sendLock.WaitAsync();
+        try
+        {
+            await _socket.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
         return await tcs.Task;
     }
 
@@ -4148,7 +5119,8 @@ sealed class CdpSession : IDisposable
 
 sealed record CdpTarget(string Id, string Title, string Type, string Url, string WebSocketDebuggerUrl);
 sealed record ResolvedApp(string AppId, string VisibleAppId, string GameName, string ParentName, bool IsDlc);
-sealed record HubcapConfig(string ApiKey, string LuaDir);
+sealed record HubcapConfig(string ApiKey, string LuaDir, string CollectionName, bool CollectionSyncEnabled);
+sealed record LauncherSettings(bool CollectionSyncEnabled = false, string CollectionName = "");
 sealed record StatusResult(bool Success, bool Available, string Error);
 sealed record CachedStatusResult(StatusResult Result, DateTimeOffset ExpiresAt);
 sealed record ActionResult(bool Success, string Error);
@@ -4158,47 +5130,25 @@ sealed record HubcapEvent(
     string Href,
     string LuaDir = "",
     string ApiKey = "",
+    bool CollectionSyncEnabled = false,
+    string CollectionName = "",
     string ManifestId = "",
     string BuildId = "",
     string Date = "",
     string Label = "",
-    string Url = "",
+    double? SettingsAnchorScreenLeft = null,
+    double? SettingsAnchorScreenTop = null,
+    double? SettingsAnchorClientLeft = null,
+    double? SettingsAnchorClientTop = null,
     List<LuaManifestOptionState>? Options = null);
 sealed record StoreWatchdogState(string AppId, bool HasUi, bool HasSetter);
 
-enum LuaDepotSection
-{
-    Unknown,
-    MainApplication,
-    Base,
-    Dlc,
-    Shared,
-    Empty
-}
+sealed record ConfigSource(string Path, ConfigSourceKind Kind);
 
-sealed class LuaDepotMeta
+enum ConfigSourceKind
 {
-    public LuaDepotSection Section { get; private init; }
-    public string Comment { get; private init; } = "";
-    public bool IsWindows { get; private init; }
-    public bool IsNonWindows { get; private init; }
-    public bool IsBase => Section == LuaDepotSection.Base;
-    public bool IsDlc => Section == LuaDepotSection.Dlc;
-    public bool IsShared => Section == LuaDepotSection.Shared || Comment.Contains("Shared from", StringComparison.OrdinalIgnoreCase);
-
-    public static LuaDepotMeta From(LuaDepotSection section, string comment)
-    {
-        var normalized = comment ?? "";
-        var isWindows = Regex.IsMatch(normalized, @"\b(win|win32|win64|windows)\b", RegexOptions.IgnoreCase);
-        var isNonWindows = Regex.IsMatch(normalized, @"\b(linux|osx|macos|mac)\b", RegexOptions.IgnoreCase);
-        return new LuaDepotMeta
-        {
-            Section = section,
-            Comment = normalized,
-            IsWindows = isWindows,
-            IsNonWindows = isNonWindows
-        };
-    }
+    Yaml,
+    ManifestJson
 }
 
 sealed class LuaManifestEntry
@@ -4206,13 +5156,6 @@ sealed class LuaManifestEntry
     public string DepotId { get; init; } = "";
     public string ManifestId { get; init; } = "";
     public string Size { get; init; } = "";
-    public string Comment { get; init; } = "";
-    public LuaDepotSection Section { get; init; }
-    public bool IsWindows { get; init; }
-    public bool IsNonWindows { get; init; }
-    public bool IsBase { get; init; }
-    public bool IsDlc { get; init; }
-    public bool IsShared { get; init; }
 }
 
 sealed class UiState
@@ -4235,12 +5178,19 @@ sealed class UiState
     public bool SettingsOnly { get; set; }
     public SettingsState? Settings { get; set; }
     public bool SettingsDraft { get; set; }
+    public double? SettingsAnchorScreenLeft { get; set; }
+    public double? SettingsAnchorScreenTop { get; set; }
+    public double? SettingsAnchorClientLeft { get; set; }
+    public double? SettingsAnchorClientTop { get; set; }
 }
 
 sealed class SettingsState
 {
     public string LuaDir { get; set; } = "";
     public string ApiKey { get; set; } = "";
+    public string CollectionName { get; set; } = "";
+    public List<string> CollectionNames { get; set; } = [];
+    public bool CollectionSyncEnabled { get; set; }
     public string Error { get; set; } = "";
     public bool ConfigMissing { get; set; }
     public string ConfigPath { get; set; } = "";
@@ -4270,8 +5220,6 @@ sealed class LuaVersionState
     public string CurrentBuildId { get; set; } = "";
     public string CurrentDate { get; set; } = "";
     public string SelectedManifestId { get; set; } = "";
-    public string BuildUrl { get; set; } = "";
-    public string ManifestUrl { get; set; } = "";
     public string StatusText { get; set; } = "";
     public string StatusTone { get; set; } = "idle";
     public List<LuaManifestOptionState> Options { get; set; } = [];
@@ -4311,9 +5259,7 @@ sealed class LuaVersionState
         GameName = gameName,
         DepotId = depotId,
         CurrentManifestId = manifestId,
-        SelectedManifestId = manifestId,
-        BuildUrl = $"https://steamdb.info/app/{appId}/patchnotes/",
-        ManifestUrl = $"https://steamdb.info/depot/{depotId}/manifests/"
+        SelectedManifestId = manifestId
     };
 
     public static LuaVersionState Error(string appId, string depotId, string manifestId, string error, string gameName = "") => new()
@@ -4324,8 +5270,6 @@ sealed class LuaVersionState
         DepotId = depotId,
         CurrentManifestId = manifestId,
         SelectedManifestId = manifestId,
-        BuildUrl = $"https://steamdb.info/app/{appId}/patchnotes/",
-        ManifestUrl = string.IsNullOrWhiteSpace(depotId) ? "" : $"https://steamdb.info/depot/{depotId}/manifests/",
         StatusText = error,
         StatusTone = "error"
     };
@@ -4361,6 +5305,162 @@ static class JsonOptions
 
 static class Scripts
 {
+    public static string SyncLuaCollection(string collectionName, IReadOnlyList<string> appIds)
+    {
+        var collectionJson = JsonSerializer.Serialize(collectionName);
+        var appIdsJson = JsonSerializer.Serialize(appIds);
+        return $$"""
+(() => (async () => {
+  const collectionName = {{collectionJson}};
+  const luaAppIds = {{appIdsJson}}
+    .map(value => Number.parseInt(String(value), 10))
+    .filter(value => Number.isInteger(value) && value > 0);
+  const store = globalThis.collectionStore;
+  if (!store) return JSON.stringify({ ok: false, error: "Steam collectionStore unavailable.", collectionName, totalLuaApps: luaAppIds.length, added: 0 });
+  if (!collectionName || !collectionName.trim()) return JSON.stringify({ ok: false, error: "Collection name is empty.", collectionName, totalLuaApps: luaAppIds.length, added: 0 });
+  if (!luaAppIds.length) return JSON.stringify({ ok: true, collectionName, collectionId: "", created: false, totalLuaApps: 0, added: 0 });
+
+  const nameOf = collection => collection?.displayName || collection?.m_strName || collection?.name || "";
+  const idOf = collection => collection?.id || collection?.m_strId || "";
+  const sameName = value => String(value || "").toLocaleLowerCase() === collectionName.toLocaleLowerCase();
+  let collection = (store.GetUserCollectionsByName?.(collectionName) || []).find(item => sameName(nameOf(item)));
+  let created = false;
+
+  if (!collection) {
+    if (typeof store.NewUnsavedCollection !== "function" || typeof store.SaveCollection !== "function") {
+      return JSON.stringify({ ok: false, error: "Steam collection creation API unavailable.", collectionName, totalLuaApps: luaAppIds.length, added: 0 });
+    }
+
+    collection = store.NewUnsavedCollection(collectionName, undefined, []);
+    await Promise.resolve(store.SaveCollection(collection));
+    created = true;
+  }
+
+  const collectionId = idOf(collection);
+  if (!collectionId) return JSON.stringify({ ok: false, error: "Could not resolve Steam collection id.", collectionName, totalLuaApps: luaAppIds.length, added: 0 });
+
+  const wasInCollection = appId => {
+    try {
+      return (store.GetCollectionListForAppID?.(appId) || []).some(item => idOf(item) === collectionId);
+    } catch {
+      return false;
+    }
+  };
+  const collectionAppIds = () => {
+    try {
+      const current = store.GetCollection?.(collectionId) || collection;
+      const apps = current?.apps || current?.allApps || current?.visibleApps || current?.m_rgApps || [];
+      return Array.from(apps)
+        .map(app => Number.parseInt(String(typeof app === "number" ? app : (app?.appid || app?.m_unAppID || app?.id || 0)), 10))
+        .filter(value => Number.isInteger(value) && value > 0);
+    } catch {
+      return [];
+    }
+  };
+  const manualValues = () => {
+    try {
+      const current = store.GetCollection?.(collectionId) || collection;
+      const source = current?.m_setAddedManually || current?.m_setApps || [];
+      return Array.from(source);
+    } catch {
+      return [];
+    }
+  };
+  const pruneManualCollection = async () => {
+    const current = store.GetCollection?.(collectionId) || collection;
+    let removed = 0;
+    for (const value of manualValues()) {
+      const appId = Number.parseInt(String(value), 10);
+      if (Number.isInteger(appId) && appId > 0 && desired.has(appId)) continue;
+      if (typeof current?.m_setAddedManually?.delete === "function" && current.m_setAddedManually.delete(value)) removed++;
+      if (typeof current?.m_setApps?.delete === "function") current.m_setApps.delete(value);
+    }
+
+    if (removed > 0) {
+      if (typeof store.SaveCollection === "function") await Promise.resolve(store.SaveCollection(current));
+      else if (typeof current?.Save === "function") await Promise.resolve(current.Save());
+    }
+
+    return removed;
+  };
+  const canAddApp = appId => {
+    try {
+      return !!globalThis.appStore?.GetAppOverviewByAppID?.(appId);
+    } catch {
+      return false;
+    }
+  };
+  const addableLuaAppIds = luaAppIds.filter(canAddApp);
+  const before = new Set(addableLuaAppIds.filter(wasInCollection));
+  const desired = new Set(luaAppIds);
+  const beforeCollection = collectionAppIds();
+  const toRemove = beforeCollection.filter(appId => !desired.has(appId));
+
+  if (typeof store.AddOrRemoveApp !== "function") {
+    return JSON.stringify({ ok: false, error: "Steam AddOrRemoveApp API unavailable.", collectionName, collectionId, created, totalLuaApps: luaAppIds.length, added: before.size });
+  }
+
+  if (addableLuaAppIds.length) store.AddOrRemoveApp(addableLuaAppIds, true, collectionId);
+  const removedManually = await pruneManualCollection();
+  await new Promise(resolve => setTimeout(resolve, 250));
+
+  const after = new Set(addableLuaAppIds.filter(wasInCollection));
+  const afterCollection = collectionAppIds();
+  return JSON.stringify({
+    ok: true,
+    collectionName: nameOf(collection) || collectionName,
+    collectionId,
+    created,
+    totalLuaApps: luaAppIds.length,
+    addableLuaApps: addableLuaAppIds.length,
+    added: after.size,
+    collectionSize: afterCollection.length,
+    newlyAdded: Array.from(after).filter(appId => !before.has(appId)).length,
+    removed: removedManually,
+    staleBefore: toRemove.length
+  });
+})().catch(error => JSON.stringify({
+  ok: false,
+  error: String(error?.message || error),
+  collectionName: {{collectionJson}},
+  totalLuaApps: ({{appIdsJson}} || []).length,
+  added: 0
+})))()
+""";
+    }
+
+    public static string RemoveLuaCollection(string collectionName)
+    {
+        var collectionJson = JsonSerializer.Serialize(collectionName);
+        return $$"""
+(() => (async () => {
+  const collectionName = {{collectionJson}};
+  const store = globalThis.collectionStore;
+  if (!store) return JSON.stringify({ ok: false, error: "Steam collectionStore unavailable.", collectionName });
+  if (!collectionName || !collectionName.trim()) return JSON.stringify({ ok: false, error: "Collection name is empty.", collectionName });
+
+  const idOf = collection => String(collection?.m_strId || collection?.id || "");
+  const nameOf = collection => collection?.displayName || collection?.m_strName || collection?.name || "";
+  const sameName = value => String(value || "").toLocaleLowerCase() === collectionName.toLocaleLowerCase();
+  const collection = (store.userCollections || []).find(item => idOf(item).startsWith("uc-") && sameName(nameOf(item)));
+  if (!collection) return JSON.stringify({ ok: false, error: "Collection not found.", collectionName });
+  const collectionId = idOf(collection);
+  if (!collectionId) return JSON.stringify({ ok: false, error: "Could not resolve Steam collection id.", collectionName });
+  if (typeof store.DeleteCollection !== "function") return JSON.stringify({ ok: false, error: "Steam collection delete API unavailable.", collectionName, collectionId });
+
+  await Promise.resolve(store.DeleteCollection(collectionId));
+  if (typeof store.WriteLocalStorage === "function") {
+    try { await Promise.resolve(store.WriteLocalStorage()); } catch {}
+  }
+  return JSON.stringify({ ok: true, collectionName: nameOf(collection) || collectionName, collectionId });
+})().catch(error => JSON.stringify({
+  ok: false,
+  error: String(error?.message || error),
+  collectionName: {{collectionJson}}
+})))()
+""";
+    }
+
     public const string TargetProbe = """
 (() => {
   const text = [location.href, document.title, document.body?.innerText?.slice(0, 500) || ""].join("\n");
@@ -4402,17 +5502,31 @@ static class Scripts
     public const string StoreUi = """
 (() => {
   const ROOT_ID = "hubcap-cdp-ui";
+  const TOP_STATS_ID = "hubcap-cdp-top-stats";
   const CONFIRM_ID = "hubcap-cdp-remove-confirm";
   const STYLE_ID = "hubcap-cdp-ui-style";
   const USAGE_CACHE_KEY = "hubcap-cdp-usage-cache";
+  const UI_VERSION = "2026-07-08-settings-click-placement-fix";
+  const STATS_Z_INDEX = 2147483647;
   document.getElementById(STYLE_ID)?.remove();
+  if (window.__hubcapCdpController) {
+    try { window.__hubcapCdpController.abort(); } catch {}
+  }
+  const controller = new AbortController();
+  window.__hubcapCdpController = controller;
+  const listen = (target, type, handler, options = {}) => target?.addEventListener?.(type, handler, { ...options, signal: controller.signal });
   const style = document.createElement("style");
   style.id = STYLE_ID;
   style.textContent = `
     #${ROOT_ID}{align-items:center;display:flex;gap:10px;justify-content:space-between;margin:8px 0 18px;min-height:34px;width:100%}
-    #${ROOT_ID} .hp-left,#${ROOT_ID} .hp-right{align-items:center;display:flex;gap:10px;min-width:0}
+    #${ROOT_ID} .hp-left,#${ROOT_ID} .hp-right,#${TOP_STATS_ID}{align-items:center;display:flex;gap:10px;min-width:0}
     #${ROOT_ID} .hp-left{flex:1 1 auto;min-height:34px}
-    #${ROOT_ID} .hp-right{flex:0 0 auto;margin-left:auto}
+    #${ROOT_ID} .hp-right{flex:0 0 auto;margin-left:auto;position:relative}
+    #${TOP_STATS_ID}{background:transparent;border:0;box-sizing:border-box;color:inherit;height:auto;margin:0;overflow:visible;padding:0;position:relative;width:max-content}
+    #${TOP_STATS_ID}[data-shell="true"],#${TOP_STATS_ID}[data-store="true"]{align-items:center;display:flex!important;margin-left:auto;pointer-events:auto;position:fixed!important;right:8px;z-index:${STATS_Z_INDEX}!important}
+    #${TOP_STATS_ID}[data-shell="true"]{right:370px;top:8px}
+    #${TOP_STATS_ID}[data-store="true"]{top:8px}
+    #${TOP_STATS_ID}[data-hidden="true"]{opacity:0!important;pointer-events:none!important;visibility:hidden!important}
     #${ROOT_ID} button{align-items:center;background:rgba(13,27,39,.48);border:1px solid rgba(103,193,245,.26);border-radius:3px;box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 1px 2px rgba(0,0,0,.24);color:#d6f4ff;cursor:pointer;display:inline-flex;font:14px Arial,Helvetica,sans-serif;height:32px;justify-content:center;line-height:1;min-height:32px;min-width:124px;padding:0 14px;text-align:center;white-space:nowrap}
     #${ROOT_ID} button:hover{background:rgba(26,52,70,.62);border-color:rgba(103,193,245,.42);color:#fff}
     #${ROOT_ID} button:disabled{cursor:default;opacity:.72}
@@ -4429,40 +5543,75 @@ static class Scripts
     #${ROOT_ID} .hp-status[data-tone="success"]{color:#a4d007;font-weight:700}
     #${ROOT_ID} .hp-warning{color:#f7c46c;display:none;font:12px Arial,Helvetica,sans-serif;font-weight:700;white-space:nowrap}
     #${ROOT_ID} .hp-warning[data-visible="true"]{display:inline-flex}
-    #${ROOT_ID} .hp-usage{background:rgba(13,27,39,.48);border:1px solid rgba(103,193,245,.26);border-radius:3px;color:#d6f4ff;cursor:pointer;font-family:Arial,Helvetica,sans-serif;min-width:190px;padding:7px 10px 8px;position:relative}
-    #${ROOT_ID} .hp-usage-row,#${ROOT_ID} .hp-usage-bottom{align-items:center;display:flex;gap:8px;justify-content:space-between}
-    #${ROOT_ID} .hp-usage-row{font-size:12px}
-    #${ROOT_ID} .hp-usage-bottom{font-size:12px;justify-content:space-between;margin-top:5px}
-    #${ROOT_ID} .hp-usage-count-wrap{align-items:center;display:inline-flex;gap:6px;margin-left:auto}
-    #${ROOT_ID} .hp-usage-name{color:#fff;font-weight:700}
-    #${ROOT_ID} .hp-usage-expiry{color:#9fc9e0;font-size:11px}
-    #${ROOT_ID} .hp-usage-bar{background:rgba(0,0,0,.26);border-radius:999px;height:4px;margin-top:6px;overflow:hidden}
-    #${ROOT_ID} .hp-usage-fill{background:linear-gradient(90deg,#a4d007 0%,#67c1f5 100%);display:block;height:100%;width:0%}
-    #${ROOT_ID} .hp-usage-spinner{animation:hubcap-cdp-spin .8s linear infinite;border:2px solid rgba(214,244,255,.28);border-top-color:#d6f4ff;border-radius:50%;display:none;height:10px;width:10px}
-    #${ROOT_ID} .hp-usage-spinner[data-visible="true"]{display:inline-flex}
-    #${ROOT_ID} .hp-settings-button{align-items:center;background:rgba(13,27,39,.38);border:1px solid rgba(103,193,245,.18);border-radius:3px;color:#9fc9e0;cursor:pointer;display:inline-flex;font:13px Arial,Helvetica,sans-serif;height:18px;justify-content:center;min-height:18px;min-width:18px;padding:0;width:18px}
-    #${ROOT_ID} .hp-settings-button:hover{background:rgba(26,52,70,.72);border-color:rgba(103,193,245,.42);color:#fff}
-    #${ROOT_ID} .hp-settings{background:rgba(13,27,39,.96);border:1px solid rgba(103,193,245,.3);border-radius:3px;box-shadow:0 8px 24px rgba(0,0,0,.38);color:#d6f4ff;display:none;font-family:Arial,Helvetica,sans-serif;min-width:360px;padding:10px;position:absolute;right:0;top:calc(100% + 8px);z-index:999999}
-    #${ROOT_ID} .hp-settings[data-visible="true"]{display:block}
-    #${ROOT_ID} .hp-settings-head{align-items:center;display:flex;font-size:12px;font-weight:700;justify-content:space-between;margin-bottom:9px}
-    #${ROOT_ID} .hp-settings-close{align-items:center;background:transparent;border:0;box-shadow:none;color:#9fc9e0;cursor:pointer;display:inline-flex;font:16px Arial,Helvetica,sans-serif;height:20px;justify-content:center;min-height:20px;min-width:20px;padding:0;width:20px}
-    #${ROOT_ID} .hp-settings-close:hover{background:rgba(255,255,255,.08);color:#fff}
-    #${ROOT_ID} .hp-field{display:grid;gap:4px;margin-top:8px}
-    #${ROOT_ID} .hp-field label{color:#9fc9e0;font-size:11px;font-weight:700}
-    #${ROOT_ID} .hp-field-row{align-items:center;display:flex;gap:6px}
-    #${ROOT_ID} .hp-field input{background:rgba(0,0,0,.24);border:1px solid rgba(103,193,245,.2);border-radius:2px;color:#d6f4ff;font:12px Consolas,monospace;height:28px;min-width:0;padding:0 8px;width:100%}
-    #${ROOT_ID} .hp-icon-button{align-items:center;background:rgba(13,27,39,.48);border:1px solid rgba(103,193,245,.26);border-radius:3px;color:#d6f4ff;cursor:pointer;display:inline-flex;font:13px Arial,Helvetica,sans-serif;height:28px;justify-content:center;min-height:28px;min-width:30px;padding:0;width:30px}
-    #${ROOT_ID} .hp-icon-button:hover{background:rgba(26,52,70,.62);border-color:rgba(103,193,245,.42);color:#fff}
-    #${ROOT_ID} .hp-config-missing{display:none;gap:10px;margin-top:8px}
-    #${ROOT_ID} .hp-config-missing[data-visible="true"]{display:grid}
-    #${ROOT_ID} .hp-config-missing-text{color:#ff9b8f;font-size:12px;font-weight:700;line-height:1.35}
-    #${ROOT_ID} .hp-settings-note{color:#9fc9e0;font-size:11px;min-height:14px;margin-top:8px}
-    #${ROOT_ID} .hp-settings-note[data-tone="error"]{color:#ff9b8f;font-weight:700}
-    #${ROOT_ID} .hp-settings-note[data-tone="success"]{color:#a4d007;font-weight:700}
-    #${ROOT_ID} .hp-settings-actions{align-items:center;display:flex;justify-content:flex-end;margin-top:8px}
-    #${ROOT_ID} .hp-save-settings{background:rgba(13,27,39,.48);border:1px solid rgba(103,193,245,.26);border-radius:3px;color:#d6f4ff;cursor:pointer;display:none;font:12px Arial,Helvetica,sans-serif;height:28px;min-height:28px;min-width:64px;padding:0 12px}
-    #${ROOT_ID} .hp-save-settings[data-visible="true"]{display:inline-flex}
-    #${ROOT_ID} .hp-save-settings:hover{background:rgba(26,52,70,.62);border-color:rgba(103,193,245,.42);color:#fff}
+    .hubcap-cdp-stats .hp-usage{align-self:center;background:rgba(13,27,39,.78);border:1px solid rgba(103,193,245,.32);border-radius:3px;box-shadow:0 8px 22px rgba(0,0,0,.34);box-sizing:border-box;color:#d6f4ff;cursor:pointer;font-family:Arial,Helvetica,sans-serif;min-width:190px;padding:7px 10px 8px;position:relative;transition:background .12s ease,border-color .12s ease,box-shadow .12s ease,color .12s ease,filter .12s ease}
+    .hubcap-cdp-stats .hp-usage:hover,.hubcap-cdp-stats .hp-usage[data-hover="true"]{background:rgba(26,52,70,.88);border-color:rgba(103,193,245,.62);box-shadow:0 0 0 1px rgba(103,193,245,.18),0 8px 24px rgba(0,0,0,.42);color:#fff;filter:brightness(1.08)}
+    .hubcap-cdp-stats .hp-usage:active,.hubcap-cdp-stats .hp-usage[data-pressed="true"]{background:rgba(18,38,53,.94);border-color:rgba(103,193,245,.78);box-shadow:0 0 0 1px rgba(103,193,245,.26),inset 0 1px 4px rgba(0,0,0,.38)}
+    #${TOP_STATS_ID} .hp-usage{height:auto;min-width:210px;overflow:visible;padding:7px 10px 8px}
+    #${TOP_STATS_ID}[data-compact="true"] .hp-usage{align-items:center;display:flex;height:24px;min-width:0;width:max-content;padding:0 9px;gap:8px}
+    #${TOP_STATS_ID}[data-compact="true"] .hp-usage-row,#${TOP_STATS_ID}[data-compact="true"] .hp-usage-bottom{align-items:center;display:flex;gap:8px;line-height:24px;margin:0;white-space:nowrap}
+    #${TOP_STATS_ID}[data-compact="true"] .hp-usage-name{max-width:82px;overflow:hidden;text-overflow:ellipsis}
+    #${TOP_STATS_ID}[data-compact="true"] .hp-usage-expiry{font-size:11px;white-space:nowrap}
+    #${TOP_STATS_ID}[data-compact="true"] .hp-usage-count-wrap{line-height:24px}
+    #${TOP_STATS_ID}[data-compact="true"] .hp-usage-bar{display:none}
+    .hubcap-cdp-stats .hp-usage-row,.hubcap-cdp-stats .hp-usage-bottom{align-items:center;display:flex;gap:8px;justify-content:space-between}
+    .hubcap-cdp-stats .hp-usage-row{font-size:12px}
+    .hubcap-cdp-stats .hp-usage-bottom{font-size:12px;justify-content:space-between;margin-top:5px}
+    #${TOP_STATS_ID} .hp-usage-row{font-size:12px;line-height:15px}
+    #${TOP_STATS_ID} .hp-usage-bottom{font-size:12px;line-height:15px;margin-top:5px}
+    #${TOP_STATS_ID} .hp-usage-bar{display:block}
+    .hubcap-cdp-stats .hp-usage-count-wrap{align-items:center;display:inline-flex;gap:6px;margin-left:0;white-space:nowrap}
+    .hubcap-cdp-stats .hp-usage-name{color:#fff;font-weight:700}
+    .hubcap-cdp-stats .hp-usage-expiry{color:#9fc9e0;font-size:11px}
+    .hubcap-cdp-stats .hp-usage-bar{background:rgba(0,0,0,.26);border-radius:999px;height:4px;margin-top:6px;overflow:hidden}
+    .hubcap-cdp-stats .hp-usage-fill{background:linear-gradient(90deg,#a4d007 0%,#67c1f5 100%);display:block;height:100%;width:0%}
+    .hubcap-cdp-stats .hp-usage-spinner{animation:hubcap-cdp-spin .8s linear infinite;border:2px solid rgba(214,244,255,.28);border-top-color:#d6f4ff;border-radius:50%;display:none;height:10px;width:10px}
+    .hubcap-cdp-stats .hp-usage-spinner[data-visible="true"]{display:inline-flex}
+    .hp-settings-button{align-items:center;background:rgba(13,27,39,.78);border:1px solid rgba(103,193,245,.32);border-radius:3px;box-shadow:0 8px 22px rgba(0,0,0,.34);box-sizing:border-box;color:#9fc9e0;cursor:pointer;display:inline-flex;font:13px Arial,Helvetica,sans-serif;height:24px;justify-content:center;min-height:24px;min-width:28px;padding:0;transition:background .12s ease,border-color .12s ease,box-shadow .12s ease,color .12s ease;width:28px}
+    .hp-settings-button:hover,.hp-settings-button[data-hover="true"]{background:rgba(26,52,70,.82);border-color:rgba(103,193,245,.58);color:#fff;box-shadow:0 0 8px rgba(103,193,245,.18)}
+    .hp-settings-button:active,.hp-settings-button[data-pressed="true"]{background:rgba(18,38,53,.94);border-color:rgba(103,193,245,.76);box-shadow:0 0 0 1px rgba(103,193,245,.24),inset 0 1px 4px rgba(0,0,0,.34);color:#fff}
+    .hp-settings{background:rgba(13,27,39,.98);border:1px solid rgba(103,193,245,.34);border-radius:4px;box-shadow:0 18px 52px rgba(0,0,0,.58);box-sizing:border-box;color:#d6f4ff;cursor:default;display:none;font-family:Arial,Helvetica,sans-serif;max-height:calc(100vh - 48px);max-width:calc(100vw - 16px);min-width:380px;overflow:auto;padding:12px;position:absolute;right:0;top:calc(100% + 8px);z-index:${STATS_Z_INDEX}}
+    .hp-settings[data-floating="true"]{position:fixed;right:auto;top:auto}
+    .hp-settings[data-visible="true"]{display:block}
+    .hp-settings-head{align-items:center;cursor:default;display:flex;font-size:12px;font-weight:700;justify-content:space-between;margin-bottom:9px;user-select:none}
+    .hp-settings-close{align-items:center;background:transparent;border:0;box-shadow:none;color:#9fc9e0;cursor:pointer;display:inline-flex;font:16px Arial,Helvetica,sans-serif;height:20px;justify-content:center;min-height:20px;min-width:20px;padding:0;width:20px}
+    .hp-settings-close:hover{background:rgba(255,255,255,.08);color:#fff}
+    .hp-field{display:grid;gap:4px;margin-top:8px}
+    .hp-field label{color:#9fc9e0;font-size:11px;font-weight:700}
+    .hp-field-row{align-items:center;display:flex;gap:6px}
+    .hp-field input,.hp-field select{background:rgba(0,0,0,.24);border:1px solid rgba(103,193,245,.2);border-radius:2px;box-sizing:border-box;color:#d6f4ff;font:12px Consolas,monospace;height:28px;min-width:0;padding:0 8px;width:100%}
+    .hp-settings input,.hp-settings textarea{cursor:text}
+    .hp-settings button,.hp-settings select{cursor:pointer}
+    .hp-field select{-webkit-appearance:none;appearance:none;background-color:rgba(14,29,42,.96);background-image:linear-gradient(45deg,transparent 50%,#9fc9e0 50%),linear-gradient(135deg,#9fc9e0 50%,transparent 50%),linear-gradient(180deg,rgba(25,49,66,.96),rgba(14,29,42,.96));background-position:calc(100% - 16px) 52%,calc(100% - 11px) 52%,0 0;background-repeat:no-repeat;background-size:5px 5px,5px 5px,100% 100%;border:1px solid rgba(103,193,245,.34);border-radius:3px;box-shadow:inset 0 1px 0 rgba(255,255,255,.05),0 1px 2px rgba(0,0,0,.22);color:#d6f4ff;cursor:pointer;font:12px Arial,Helvetica,sans-serif;height:30px;line-height:30px;outline:0;padding:0 34px 0 10px}
+    .hp-field select:hover{background-image:linear-gradient(45deg,transparent 50%,#fff 50%),linear-gradient(135deg,#fff 50%,transparent 50%),linear-gradient(180deg,rgba(31,59,78,.98),rgba(17,35,50,.98));border-color:rgba(103,193,245,.52);color:#fff}
+    .hp-field select:focus{border-color:rgba(103,193,245,.72);box-shadow:0 0 0 1px rgba(103,193,245,.2),inset 0 1px 0 rgba(255,255,255,.05)}
+    .hp-field select option{background:#102334;color:#d6f4ff}
+    .hp-toggle-row{align-items:center;display:flex;justify-content:space-between;margin-top:10px}
+    .hp-toggle-label{align-items:center;color:#9fc9e0;display:inline-flex;font-size:11px;font-weight:700;gap:7px;min-width:0}
+    .hp-current-collection{color:#d6f4ff;font-size:11px;font-weight:400;max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .hp-group-lua-toggle{align-items:center;background:rgba(0,0,0,.26);border:1px solid rgba(103,193,245,.28);border-radius:999px;box-sizing:border-box;cursor:pointer;display:inline-flex;height:22px;min-width:42px;padding:2px;transition:background .12s ease,border-color .12s ease;width:42px}
+    .hp-group-lua-toggle::before{background:#8f98a0;border-radius:50%;box-shadow:0 1px 3px rgba(0,0,0,.34);content:"";display:block;height:16px;transition:transform .12s ease,background .12s ease;width:16px}
+    .hp-group-lua-toggle[data-on="true"]{background:rgba(103,193,245,.28);border-color:rgba(103,193,245,.58)}
+    .hp-group-lua-toggle[data-on="true"]::before{background:#67c1f5;transform:translateX(18px)}
+    .hp-group-lua-options{display:none}
+    .hp-group-lua-options[data-visible="true"]{display:grid}
+    .hp-new-collection-row{display:none}
+    .hp-new-collection-row[data-visible="true"]{display:flex}
+    .hp-remove-collection{color:#ffb3aa}
+    .hp-remove-collection:hover{background:rgba(95,33,31,.68);border-color:rgba(217,75,63,.48);color:#fff1ef}
+    .hp-remove-collection[data-visible="false"]{display:none}
+    .hp-icon-button{align-items:center;background:rgba(13,27,39,.48);border:1px solid rgba(103,193,245,.26);border-radius:3px;color:#d6f4ff;cursor:pointer;display:inline-flex;font:13px Arial,Helvetica,sans-serif;height:28px;justify-content:center;min-height:28px;min-width:30px;padding:0;width:30px}
+    .hp-icon-button:hover{background:rgba(26,52,70,.62);border-color:rgba(103,193,245,.42);color:#fff}
+    .hp-config-missing{display:none;gap:10px;margin-top:8px}
+    .hp-config-missing[data-visible="false"]{display:none!important}
+    .hp-config-missing[data-visible="true"]{display:grid}
+    .hp-config-missing-text{color:#ff9b8f;font-size:12px;font-weight:700;line-height:1.35}
+    .hp-settings-note{color:#9fc9e0;font-size:11px;min-height:14px;margin-top:8px}
+    .hp-settings-note[data-tone="error"]{color:#ff9b8f;font-weight:700}
+    .hp-settings-note[data-tone="success"]{color:#a4d007;font-weight:700}
+    .hp-settings-actions{align-items:center;display:flex;justify-content:flex-end;margin-top:8px}
+    .hp-save-settings{align-items:center;background:rgba(13,27,39,.48);border:1px solid rgba(103,193,245,.26);border-radius:3px;color:#d6f4ff;cursor:pointer;display:none;font:12px Arial,Helvetica,sans-serif;height:28px;justify-content:center;min-height:28px;min-width:64px;padding:0 12px}
+    .hp-save-settings[data-visible="true"]{display:inline-flex}
+    .hp-save-settings:hover{background:rgba(26,52,70,.62);border-color:rgba(103,193,245,.42);color:#fff}
     #${CONFIRM_ID}{align-items:center;background:rgba(0,0,0,.58);bottom:0;box-sizing:border-box;display:flex;font-family:Arial,Helvetica,sans-serif;justify-content:center;left:0;padding:18px;position:fixed;right:0;top:0;z-index:9999999}
     #${CONFIRM_ID} .hp-confirm-box{background:linear-gradient(135deg,rgba(22,40,55,.98),rgba(16,31,43,.98));border:1px solid rgba(103,193,245,.3);border-radius:4px;box-shadow:0 18px 48px rgba(0,0,0,.55);box-sizing:border-box;color:#dfe3e6;max-width:360px;padding:16px;width:min(360px,calc(100vw - 36px))}
     #${CONFIRM_ID} .hp-confirm-title{color:#fff;font-size:16px;font-weight:700;line-height:20px;margin-bottom:8px}
@@ -4479,20 +5628,334 @@ static class Scripts
   const existingRoot = document.getElementById(ROOT_ID);
   const root = existingRoot || document.createElement("div");
   root.id = ROOT_ID;
-  if (!existingRoot || !root.querySelector(".hp-settings-button") || !root.querySelector(".hp-config-missing") || root.querySelector(".hp-open-config-file")) root.innerHTML = `
+  const shouldRebuild = !existingRoot || root.dataset.uiVersion !== UI_VERSION || !root.querySelector(`#${TOP_STATS_ID}`) || !root.querySelector(".hp-settings-button") || !root.querySelector(".hp-config-missing") || !root.querySelector(".hp-group-lua-toggle") || root.querySelector(".hp-open-config-file");
+  if (shouldRebuild) {
+    root.dataset.bound = "";
+    root.dataset.uiVersion = UI_VERSION;
+    document.querySelectorAll(`#${TOP_STATS_ID}`).forEach(panel => panel.remove());
+    document.querySelectorAll(".hp-settings").forEach(panel => { if (!root.contains(panel)) panel.remove(); });
+    root.innerHTML = `
     <div class="hp-left"><button class="hp-main" type="button" data-state="checking" disabled>Checking...</button><button class="hp-library" type="button" style="display:none">Go to Library</button><span class="hp-status"></span><span class="hp-warning"></span></div>
-    <div class="hp-right"><div class="hp-usage"><div class="hp-usage-row"><span class="hp-usage-name">Hubcap</span><span class="hp-usage-expiry">Expires --</span></div><div class="hp-usage-bar"><span class="hp-usage-fill"></span></div><div class="hp-usage-bottom"><button class="hp-settings-button" type="button" title="Hubcap settings">&#9881;</button><span class="hp-usage-count-wrap">Daily Usage: <strong class="hp-usage-count">--/--</strong><span class="hp-usage-spinner"></span></span></div><div class="hp-settings"><div class="hp-settings-head"><span>Hubcap Settings</span><button class="hp-settings-close" type="button" title="Close">&times;</button></div><div class="hp-config-missing"><div class="hp-config-missing-text">Config file not found. Make sure HubcapTools is installed.</div></div><div class="hp-field"><label>Lua Folder</label><div class="hp-field-row"><input class="hp-lua-dir" type="text"><button class="hp-icon-button hp-open-lua-folder" type="button" title="Select Lua folder">&#128193;</button></div></div><div class="hp-field"><label>API Key</label><div class="hp-field-row"><input class="hp-api-key" type="password"><button class="hp-icon-button hp-toggle-api-key" type="button" title="Show API key">&#128065;</button><button class="hp-icon-button hp-copy-api-key" type="button" title="Copy API key">&#128203;</button></div></div><div class="hp-settings-note"></div><div class="hp-settings-actions"><button class="hp-save-settings" type="button">Save</button></div></div></div></div>`;
+    <div class="hp-right hubcap-cdp-stats" id="${TOP_STATS_ID}"><button class="hp-settings-button" type="button" title="Hubcap settings">&#9881;</button><div class="hp-usage" title="Refresh usage"><div class="hp-usage-row"><span class="hp-usage-name">Hubcap</span><span class="hp-usage-expiry">Expires --</span></div><div class="hp-usage-bar"><span class="hp-usage-fill"></span></div><div class="hp-usage-bottom"><span class="hp-usage-count-wrap">Daily Usage: <strong class="hp-usage-count">--/--</strong><span class="hp-usage-spinner"></span></span></div></div><div class="hp-settings"><div class="hp-settings-head"><span>Hubcap Settings</span><button class="hp-settings-close" type="button" title="Close">&times;</button></div><div class="hp-config-missing"><div class="hp-config-missing-text">Config file not found. Make sure HubcapTools is installed.</div></div><div class="hp-field"><label>Lua Folder</label><div class="hp-field-row"><input class="hp-lua-dir" type="text"><button class="hp-icon-button hp-open-lua-folder" type="button" title="Select Lua folder">&#128193;</button></div></div><div class="hp-field"><label>API Key</label><div class="hp-field-row"><input class="hp-api-key" type="password"><button class="hp-icon-button hp-toggle-api-key" type="button" title="Show API key">&#128065;</button><button class="hp-icon-button hp-copy-api-key" type="button" title="Copy API key">&#128203;</button></div></div><div class="hp-toggle-row hp-group-lua-row"><span class="hp-toggle-label">Group Lua <span class="hp-current-collection"></span></span><button class="hp-group-lua-toggle" type="button" data-on="false" title="Group Lua"></button></div><div class="hp-field hp-group-lua-options"><label>Collection</label><div class="hp-field-row"><select class="hp-collection-name"></select><button class="hp-icon-button hp-remove-collection" type="button" title="Remove selected collection">&times;</button></div><div class="hp-field-row hp-new-collection-row"><input class="hp-new-collection-name" type="text" placeholder="New collection name"></div></div><div class="hp-settings-note"></div><div class="hp-settings-actions"><button class="hp-save-settings" type="button">Save</button></div></div></div>`;
+  }
   const appIdFromText = value => (String(value || "").match(/\/app\/(\d+)(?:\/|$)/)?.[1] || String(value || "").match(/store\.steampowered\.com\/app\/(\d+)(?:\/|$)/)?.[1] || "");
   const appIdFromUrl = () => appIdFromText(location.href) || appIdFromText(location.pathname) || appIdFromText(document.URL) || appIdFromText(document.querySelector('link[rel="canonical"]')?.href) || appIdFromText(document.querySelector('meta[property="og:url"]')?.content) || appIdFromText(globalThis.MainWindowBrowserManager?.m_lastLocation?.pathname || "") || appIdFromText(globalThis.MainWindowBrowserManager?.m_lastLocation?.href || "");
+  const statsRoot = () => document.getElementById(TOP_STATS_ID) || root.querySelector(`#${TOP_STATS_ID}`) || root;
+  const settingsPanel = () => document.querySelector('.hp-settings[data-hubcap-settings="true"]') || statsRoot()?.querySelector?.(".hp-settings") || root.querySelector(".hp-settings");
   function headerHost(){return document.querySelector(".apphub_HeaderStandardTop") || document.querySelector(".apphub_AppName")?.parentElement || null;}
   function earlyHost(){return headerHost() || document.querySelector("#game_highlights")?.parentElement || document.querySelector(".game_page_background") || document.querySelector(".game_background_glow") || null;}
   function looksLikeAppPage(){return !!(appIdFromUrl()||headerHost()||document.querySelector("#game_highlights")||document.querySelector(".game_page_background"));}
+  function isStoreDocument(){return location.hostname === "store.steampowered.com";}
+  function isSteamShellDocument(){return document.title === "Steam" && /STORE\s*LIBRARY\s*COMMUNITY/i.test(document.body?.innerText || "");}
+  function activeSteamShellTab(){
+    if(!isSteamShellDocument()) return "";
+    const labels=Array.from(document.querySelectorAll("div,span"))
+      .map(element=>({element,text:(element.innerText||element.textContent||"").trim(),rect:element.getBoundingClientRect(),color:getComputedStyle(element).color}))
+      .filter(item=>["STORE","LIBRARY","COMMUNITY","OOGIEFIED","CONSOLE"].includes(item.text)&&item.rect.y>=30&&item.rect.y<=70);
+    return labels.find(item=>/rgb\(\s*26\s*,\s*159\s*,\s*255\s*\)/i.test(item.color))?.text||"";
+  }
+  function closeSettings(event) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const panel = settingsPanel();
+    window.__hubcapSettingsGloballyVisible = "false";
+    window.__hubcapSettingsAnchor = null;
+    if (panel) {
+      panel.dataset.visible = "false";
+      panel.style.removeProperty("display");
+    }
+    if (event) send("closeSettings");
+  }
+  function clampSettingsPanel(panel, left, top) {
+    const rect = panel.getBoundingClientRect();
+    const width = Math.max(380, rect.width || 380);
+    const height = Math.max(80, rect.height || 80);
+    const nextLeft = Math.max(8, Math.min(window.innerWidth - width - 8, Math.round(left)));
+    const nextTop = Math.max(8, Math.min(window.innerHeight - height - 8, Math.round(top)));
+    panel.style.left = `${nextLeft}px`;
+    panel.style.top = `${nextTop}px`;
+  }
+  function canDragSettingsFrom(target) {
+    return !target?.closest?.("input,textarea,select,button,a");
+  }
+  function wireSettingsDrag(panel) {
+    if (!panel || panel.dataset.dragBound === "true") return;
+    panel.dataset.dragBound = "true";
+    panel.addEventListener("pointerdown", event => {
+      if (event.button !== 0 || !canDragSettingsFrom(event.target)) return;
+      const rect = panel.getBoundingClientRect();
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const startLeft = rect.left;
+      const startTop = rect.top;
+      panel.dataset.dragged = "true";
+      panel.setPointerCapture?.(event.pointerId);
+      event.preventDefault();
+      event.stopPropagation();
+      const move = moveEvent => {
+        clampSettingsPanel(panel, startLeft + moveEvent.clientX - startX, startTop + moveEvent.clientY - startY);
+      };
+      const done = upEvent => {
+        panel.releasePointerCapture?.(event.pointerId);
+        document.removeEventListener("pointermove", move, true);
+        document.removeEventListener("pointerup", done, true);
+        document.removeEventListener("pointercancel", done, true);
+        upEvent?.stopPropagation?.();
+      };
+      document.addEventListener("pointermove", move, true);
+      document.addEventListener("pointerup", done, true);
+      document.addEventListener("pointercancel", done, true);
+    }, true);
+  }
+  function ensureSettingsPanelLayer(panel = settingsPanel()) {
+    if (!panel) return null;
+    panel.dataset.hubcapSettings = "true";
+    const floating = isSteamShellDocument() || isStoreDocument();
+    panel.dataset.floating = floating ? "true" : "false";
+    if (floating && panel.parentElement !== document.body) document.body.appendChild(panel);
+    wireSettingsDrag(panel);
+    return panel;
+  }
+  function wireSettingsPopup(panel) {
+    panel = ensureSettingsPanelLayer(panel);
+    const close = panel?.querySelector?.(".hp-settings-close");
+    if (close) close.onclick = closeSettings;
+    const luaDir = panel?.querySelector?.(".hp-lua-dir");
+    const apiKey = panel?.querySelector?.(".hp-api-key");
+    const groupLuaToggle = panel?.querySelector?.(".hp-group-lua-toggle");
+    const collectionName = panel?.querySelector?.(".hp-collection-name");
+    const newCollectionName = panel?.querySelector?.(".hp-new-collection-name");
+    const removeCollection = panel?.querySelector?.(".hp-remove-collection");
+    const folder = panel?.querySelector?.(".hp-open-lua-folder");
+    const save = panel?.querySelector?.(".hp-save-settings");
+    const toggle = panel?.querySelector?.(".hp-toggle-api-key");
+    const copy = panel?.querySelector?.(".hp-copy-api-key");
+    if (luaDir) luaDir.oninput = updateSaveState;
+    if (apiKey) apiKey.oninput = updateSaveState;
+    if (groupLuaToggle) groupLuaToggle.onclick = event => { event.preventDefault(); event.stopPropagation(); event.stopImmediatePropagation?.(); setGroupLuaEnabled(groupLuaToggle.dataset.on !== "true"); updateSaveState(); };
+    if (collectionName) collectionName.onchange = () => { updateGroupLuaNewRow(); updateSaveState(); };
+    if (newCollectionName) newCollectionName.oninput = updateSaveState;
+    if (removeCollection) removeCollection.onclick = event => { event.preventDefault(); event.stopPropagation(); event.stopImmediatePropagation?.(); removeSelectedCollection(); };
+    if (folder) folder.onclick = event => { event.preventDefault(); event.stopPropagation(); setSettingsNote("Selecting Lua folder..."); send("openLuaFolder"); };
+    if (save) save.onclick = event => { event.preventDefault(); event.stopPropagation(); saveSettings(); };
+    if (toggle) toggle.onclick = event => { event.preventDefault(); event.stopPropagation(); const input = settingsPanel()?.querySelector(".hp-api-key"); if (input) input.type = input.type === "password" ? "text" : "password"; };
+    if (copy) copy.onclick = async event => { event.preventDefault(); event.stopPropagation(); const value = settingsPanel()?.querySelector(".hp-api-key").value || ""; try { await navigator.clipboard.writeText(value); setSettingsNote("API key copied."); } catch { send("copyApiKey"); setSettingsNote("API key copied."); } };
+  }
+  function revealSettingsPopup() {
+    const panel = ensureSettingsPanelLayer(settingsPanel());
+    if (!panel) return null;
+    wireSettingsPopup(panel);
+    panel.dataset.visible = "true";
+    positionSettingsPanel(panel, currentSettingsAnchor());
+    return panel;
+  }
+  function repositionVisibleSettingsPanel() {
+    const panel = settingsPanel();
+    if (panel?.dataset.visible === "true") positionSettingsPanel(panel, window.__hubcapSettingsAnchor || currentSettingsAnchor());
+  }
+  function currentSettingsAnchor() {
+    const stats = statsRoot();
+    const button = stats?.querySelector?.(".hp-settings-button");
+    const target = button || stats;
+    const statsRect = stats?.getBoundingClientRect?.();
+    const targetRect = target?.getBoundingClientRect?.();
+    if (!targetRect || !statsRect || targetRect.width <= 0 || statsRect.height <= 0) return null;
+    return {
+      settingsAnchorScreenLeft: window.screenX + targetRect.left,
+      settingsAnchorScreenTop: window.screenY + statsRect.bottom + 8,
+      settingsAnchorClientLeft: targetRect.left,
+      settingsAnchorClientTop: statsRect.bottom + 8
+    };
+  }
+  function normalizeSettingsAnchor(anchor) {
+    const screenLeft = Number(anchor?.settingsAnchorScreenLeft ?? anchor?.screenLeft ?? NaN);
+    const screenTop = Number(anchor?.settingsAnchorScreenTop ?? anchor?.screenTop ?? NaN);
+    const clientLeft = Number(anchor?.settingsAnchorClientLeft ?? anchor?.clientLeft ?? NaN);
+    const clientTop = Number(anchor?.settingsAnchorClientTop ?? anchor?.clientTop ?? NaN);
+    if ((!Number.isFinite(screenLeft) || !Number.isFinite(screenTop)) && (!Number.isFinite(clientLeft) || !Number.isFinite(clientTop))) return null;
+    return { settingsAnchorScreenLeft: screenLeft, settingsAnchorScreenTop: screenTop, settingsAnchorClientLeft: clientLeft, settingsAnchorClientTop: clientTop };
+  }
+  function positionSettingsPanel(panel, anchor = null) {
+    panel = ensureSettingsPanelLayer(panel);
+    const stats = statsRoot();
+    if (!panel || !stats) {
+      panel?.style.removeProperty("left");
+      panel?.style.removeProperty("top");
+      return;
+    }
+    if (panel.dataset.dragged === "true" && panel.style.left && panel.style.top) {
+      const rect = panel.getBoundingClientRect();
+      clampSettingsPanel(panel, rect.left, rect.top);
+      return;
+    }
+    const normalizedAnchor = normalizeSettingsAnchor(anchor) || normalizeSettingsAnchor(window.__hubcapSettingsAnchor);
+    if (normalizedAnchor) {
+      const left = Number.isFinite(normalizedAnchor.settingsAnchorClientLeft) ? normalizedAnchor.settingsAnchorClientLeft : normalizedAnchor.settingsAnchorScreenLeft - window.screenX;
+      const top = Number.isFinite(normalizedAnchor.settingsAnchorClientTop) ? normalizedAnchor.settingsAnchorClientTop : normalizedAnchor.settingsAnchorScreenTop - window.screenY;
+      clampSettingsPanel(panel, left, top);
+      return;
+    }
+    const rect = stats.getBoundingClientRect();
+    const width = Math.max(380, panel.getBoundingClientRect().width || 380);
+    const hasAnchor = rect.width > 0 && rect.height > 0;
+    const left = hasAnchor ? rect.left : window.innerWidth - width - 22;
+    const top = hasAnchor ? rect.bottom + 8 : isStoreDocument() ? 40 : 100;
+    clampSettingsPanel(panel, left, top);
+  }
+  function openSettings(event) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    if (event?.__hubcapSettingsHandled) return "";
+    if (event) event.__hubcapSettingsHandled = true;
+    window.__hubcapSettingsOpenedAt=Date.now();
+    const panel = settingsPanel();
+    if (panel?.dataset.visible === "true" || window.__hubcapSettingsGloballyVisible === "true") {
+      closeSettings(event);
+      if (!event) send("closeSettings");
+      return "closeSettings";
+    }
+    if (panel) panel.dataset.dragged = "false";
+    window.__hubcapSettingsGloballyVisible = "true";
+    const anchor = currentSettingsAnchor();
+    if (anchor) window.__hubcapSettingsAnchor = anchor;
+    revealSettingsPopup();
+    setSettingsNote("Loading...");
+    send("settings", anchor || {});
+    return "settings";
+  }
+  function setPressableState(element, hover = null, pressed = null) {
+    if (!element) return;
+    if (hover !== null) element.dataset.hover = hover ? "true" : "false";
+    if (pressed !== null) element.dataset.pressed = pressed ? "true" : "false";
+  }
+  function wirePressable(element, onActivate) {
+    if (!element) return;
+    if (element.dataset.pressableBound !== "true") {
+      element.dataset.pressableBound = "true";
+      element.addEventListener("pointerenter", () => setPressableState(element, true, null));
+      element.addEventListener("pointerleave", () => setPressableState(element, false, false));
+      element.addEventListener("mouseover", () => setPressableState(element, true, null));
+      element.addEventListener("mouseout", event => { if (!element.contains(event.relatedTarget)) setPressableState(element, false, false); });
+      element.addEventListener("pointerdown", event => {
+        setPressableState(element, true, true);
+      }, { capture: true });
+      element.addEventListener("mousedown", event => {
+        setPressableState(element, true, true);
+      }, { capture: true });
+      element.addEventListener("pointerup", () => setPressableState(element, true, false));
+      element.addEventListener("mouseup", () => setPressableState(element, true, false));
+      element.addEventListener("click", event => onActivate?.(event), { capture: true });
+    }
+  }
+  function updateTopBarPointerState(clientX, clientY) {
+    const stats = statsRoot();
+    if (!stats || stats === root || !Number.isFinite(clientX) || !Number.isFinite(clientY)) return;
+    const hit = document.elementFromPoint(clientX, clientY);
+    const button = stats.querySelector(".hp-settings-button");
+    const usage = stats.querySelector(".hp-usage");
+    const overButton = !!hit?.closest?.(".hp-settings-button");
+    const overUsage = !overButton && !!hit?.closest?.(".hp-usage");
+    setPressableState(button, overButton, null);
+    setPressableState(usage, overUsage, null);
+  }
+  function wireTopBarPointerTracking() {
+    if (window.__hubcapTopBarPointerTracking === "true") return;
+    window.__hubcapTopBarPointerTracking = "true";
+    const move = event => updateTopBarPointerState(event.clientX, event.clientY);
+    const clear = () => {
+      const stats = statsRoot();
+      setPressableState(stats?.querySelector(".hp-settings-button"), false, false);
+      setPressableState(stats?.querySelector(".hp-usage"), false, false);
+    };
+    document.addEventListener("mousemove", move, true);
+    document.addEventListener("pointermove", move, true);
+    document.addEventListener("mouseout", event => { if (!event.relatedTarget) clear(); }, true);
+    window.addEventListener("blur", clear, true);
+  }
+  function wireTopBarControls() {
+    const stats = statsRoot();
+    if (!stats || stats === root) return;
+    wireTopBarPointerTracking();
+    wirePressable(stats.querySelector(".hp-settings-button"), event => {
+      openSettings(event);
+      event?.stopImmediatePropagation?.();
+    });
+    wirePressable(stats.querySelector(".hp-usage"), null);
+  }
+  window.__hubcapCdpTopStatsPointer = state => {
+    const stats = statsRoot();
+    if (!stats || stats === root || stats.dataset.shell !== "true") return { ok: false };
+    const button = stats.querySelector(".hp-settings-button");
+    const usage = stats.querySelector(".hp-usage");
+    if (!button || !usage) return { ok: false };
+    const x = Number(state?.screenX ?? NaN) - window.screenX;
+    const y = Number(state?.screenY ?? NaN) - window.screenY;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return { ok: false };
+    const inside = rect => x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+    const overButton = inside(button.getBoundingClientRect());
+    const overUsage = !overButton && inside(usage.getBoundingClientRect());
+    const leftDown = !!state?.leftDown;
+    setPressableState(button, overButton, overButton && leftDown);
+    setPressableState(usage, overUsage, overUsage && leftDown);
+    if (state?.clicked && overButton) {
+      const action = openSettings();
+      const anchor = window.__hubcapSettingsAnchor || currentSettingsAnchor();
+      return { ok: true, action, overButton, overUsage, settingsAnchorScreenLeft: anchor?.settingsAnchorScreenLeft, settingsAnchorScreenTop: anchor?.settingsAnchorScreenTop, settingsAnchorClientLeft: anchor?.settingsAnchorClientLeft, settingsAnchorClientTop: anchor?.settingsAnchorClientTop };
+    }
+    if (state?.clicked && overUsage) {
+      send("refresh");
+      return { ok: true, action: "refresh", overButton, overUsage };
+    }
+    return { ok: true, action: "", overButton, overUsage };
+  };
+  function shellTopBarHost() {
+    if (!isSteamShellDocument()) return null;
+    const labels = Array.from(document.querySelectorAll("div,span,a,button"))
+      .map(element => ({ element, text: (element.innerText || element.textContent || "").trim(), rect: element.getBoundingClientRect() }))
+      .filter(item => ["STORE","LIBRARY","COMMUNITY"].includes(item.text) && item.rect.top >= 20 && item.rect.top <= 80);
+    if (labels.length < 2) return null;
+    const first = labels[0].element;
+    for (let node = first.parentElement; node && node !== document.body; node = node.parentElement) {
+      const rect = node.getBoundingClientRect();
+      const count = labels.filter(item => node.contains(item.element)).length;
+      if (count >= 2 && rect.top >= 0 && rect.top <= 90 && rect.height >= 24 && rect.height <= 90 && rect.width >= 400) {
+        return node;
+      }
+    }
+    return first.parentElement;
+  }
+  function placeStats() {
+    const stats = statsRoot();
+    if (!stats || stats === root) return;
+    if (isSteamShellDocument() || isStoreDocument()) {
+      const host = document.body;
+      if (stats.parentElement !== host) host.appendChild(stats);
+      stats.dataset.compact = "true";
+      stats.dataset.shell = isSteamShellDocument() ? "true" : "false";
+      stats.dataset.store = isStoreDocument() ? "true" : "false";
+      stats.dataset.hidden = isStoreDocument() ? "true" : "false";
+      stats.style.removeProperty("left");
+      stats.style.removeProperty("top");
+      stats.style.removeProperty("right");
+      ensureSettingsPanelLayer();
+      return;
+    }
+    if (stats.parentElement !== root) root.appendChild(stats);
+    stats.dataset.compact = "false";
+    stats.dataset.shell = "false";
+    stats.dataset.store = "false";
+    stats.dataset.hidden = "false";
+    stats.style.removeProperty("left");
+    stats.style.removeProperty("top");
+    stats.style.removeProperty("right");
+  }
   function placeRoot() {
     const host = earlyHost();
     if (!looksLikeAppPage() || !host) {
       root.style.display = "none";
       if (!root.parentElement) document.body.prepend(root);
-      return false;
+      placeStats();
+      return isStoreDocument() || isSteamShellDocument();
     }
     root.style.display = "flex";
     const title = document.querySelector(".apphub_AppName");
@@ -4501,6 +5964,7 @@ static class Scripts
     else if (highlights?.parentElement === host && root.parentElement !== host) host.insertBefore(root, highlights);
     else if (host.classList?.contains("game_page_background") && root.parentElement !== host) host.prepend(root);
     else if (root.parentElement !== host) host.appendChild(root);
+    placeStats();
     return true;
   }
   placeRoot();
@@ -4509,13 +5973,13 @@ static class Scripts
     if (typeof window.hubcapNative === "function") window.hubcapNative(payload);
     else console.warn("[Hubcap CDP] native binding unavailable", payload);
   };
-  function showRemoveConfirm(onConfirm) {
+  function showConfirm(title, message, onConfirm) {
     document.getElementById(CONFIRM_ID)?.remove();
     const modal = document.createElement("div");
     modal.id = CONFIRM_ID;
-    modal.innerHTML = `<div class="hp-confirm-box"><div class="hp-confirm-title">Remove Lua?</div><div class="hp-confirm-message"></div><div class="hp-confirm-actions"><button class="hp-confirm-no" type="button">No</button><button class="hp-confirm-yes" type="button">Yes</button></div></div>`;
-    const gameName = document.querySelector(".apphub_AppName")?.textContent?.trim() || `app ${appIdFromUrl()}`;
-    modal.querySelector(".hp-confirm-message").textContent = `Remove Lua for ${gameName}? This will delete the local Lua file.`;
+    modal.innerHTML = `<div class="hp-confirm-box"><div class="hp-confirm-title"></div><div class="hp-confirm-message"></div><div class="hp-confirm-actions"><button class="hp-confirm-yes" type="button">Yes</button><button class="hp-confirm-no" type="button">No</button></div></div>`;
+    modal.querySelector(".hp-confirm-title").textContent = title;
+    modal.querySelector(".hp-confirm-message").textContent = message;
     const close = () => modal.remove();
     modal.querySelector(".hp-confirm-no").addEventListener("click", event => { event.preventDefault(); event.stopPropagation(); close(); });
     modal.querySelector(".hp-confirm-yes").addEventListener("click", event => { event.preventDefault(); event.stopPropagation(); close(); onConfirm(); });
@@ -4523,48 +5987,146 @@ static class Scripts
     document.body.appendChild(modal);
     modal.querySelector(".hp-confirm-no").focus();
   }
+  function showRemoveConfirm(onConfirm) {
+    const gameName = document.querySelector(".apphub_AppName")?.textContent?.trim() || `app ${appIdFromUrl()}`;
+    showConfirm("Remove Lua?", `Remove Lua for ${gameName}? This will delete the local Lua file.`, onConfirm);
+  }
   function setSettingsNote(message, tone = "idle") {
-    const note = root.querySelector(".hp-settings-note");
+    const note = settingsPanel()?.querySelector(".hp-settings-note");
     if (!note) return;
     note.textContent = message || "";
     note.dataset.tone = tone;
   }
+  function updateGroupLuaNewRow() {
+    const panel = settingsPanel();
+    const select = panel?.querySelector(".hp-collection-name");
+    const row = panel?.querySelector(".hp-new-collection-row");
+    const remove = panel?.querySelector(".hp-remove-collection");
+    if (row) row.dataset.visible = select?.value === "__new__" ? "true" : "false";
+    if (remove) remove.dataset.visible = select?.value && select.value !== "__new__" ? "true" : "false";
+  }
+  function setGroupLuaEnabled(enabled) {
+    const panel = settingsPanel();
+    const toggle = panel?.querySelector(".hp-group-lua-toggle");
+    const options = panel?.querySelector(".hp-group-lua-options");
+    const currentCollection = panel?.querySelector(".hp-current-collection");
+    if (toggle) toggle.dataset.on = enabled ? "true" : "false";
+    if (options) options.dataset.visible = enabled ? "true" : "false";
+    if (currentCollection) currentCollection.textContent = enabled ? `Current: ${root.dataset.collectionName || "None"}` : "";
+    updateGroupLuaNewRow();
+  }
+  function selectedCollectionName() {
+    const panel = settingsPanel();
+    const select = panel?.querySelector(".hp-collection-name");
+    const input = panel?.querySelector(".hp-new-collection-name");
+    const selected = select?.value || "";
+    return (selected === "__new__" ? input?.value : selected).trim();
+  }
+  function populateCollectionNames(names, selectedName) {
+    const panel = settingsPanel();
+    const select = panel?.querySelector(".hp-collection-name");
+    if (!select) return;
+    const selected = selectedName || "";
+    const unique = Array.from(new Set((Array.isArray(names) ? names : []).filter(Boolean)));
+    select.innerHTML = "";
+    for (const name of unique) {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      select.appendChild(option);
+    }
+    const add = document.createElement("option");
+    add.value = "__new__";
+    add.textContent = "Add collection...";
+    select.appendChild(add);
+    select.value = selected && unique.includes(selected) ? selected : "__new__";
+    const input = panel?.querySelector(".hp-new-collection-name");
+    if (input && select.value === "__new__" && selected) input.value = selected;
+    updateGroupLuaNewRow();
+  }
+  function saveSettings() {
+    const panel = settingsPanel();
+    const enabled = panel?.querySelector(".hp-group-lua-toggle")?.dataset.on === "true";
+    setSettingsNote("Saving...");
+    send("saveSettings",{
+      luaDir: panel?.querySelector(".hp-lua-dir").value || "",
+      apiKey: panel?.querySelector(".hp-api-key").value || "",
+      collectionSyncEnabled: enabled,
+      collectionName: selectedCollectionName()
+    });
+  }
+  function removeSelectedCollection() {
+    const name = selectedCollectionName();
+    if (!name) return;
+    showConfirm("Remove Collection?", `Remove Steam collection "${name}"? Lua files will not be deleted.`, () => {
+      setSettingsNote("Removing collection...");
+      send("removeCollection", { collectionName: name });
+    });
+  }
   function updateSaveState() {
-    const luaDir = root.querySelector(".hp-lua-dir");
-    const apiKey = root.querySelector(".hp-api-key");
-    const save = root.querySelector(".hp-save-settings");
-    if (!luaDir || !apiKey || !save) return;
+    const panel = settingsPanel();
+    const luaDir = panel?.querySelector(".hp-lua-dir");
+    const apiKey = panel?.querySelector(".hp-api-key");
+    const groupLuaToggle = panel?.querySelector(".hp-group-lua-toggle");
+    const save = panel?.querySelector(".hp-save-settings");
+    if (!luaDir || !apiKey || !groupLuaToggle || !save) return;
     save.dataset.visible = hasSettingsChanges() ? "true" : "false";
   }
   function hasSettingsChanges() {
-    const luaDir = root.querySelector(".hp-lua-dir");
-    const apiKey = root.querySelector(".hp-api-key");
-    return !!luaDir && !!apiKey && (luaDir.value !== (root.dataset.luaDir || "") || apiKey.value !== (root.dataset.apiKey || ""));
+    const panel = settingsPanel();
+    const luaDir = panel?.querySelector(".hp-lua-dir");
+    const apiKey = panel?.querySelector(".hp-api-key");
+    const groupLuaToggle = panel?.querySelector(".hp-group-lua-toggle");
+    const enabled = groupLuaToggle?.dataset.on === "true";
+    return !!luaDir && !!apiKey && !!groupLuaToggle && (luaDir.value !== (root.dataset.luaDir || "") || apiKey.value !== (root.dataset.apiKey || "") || String(enabled) !== (root.dataset.collectionSyncEnabled || "false") || selectedCollectionName() !== (root.dataset.collectionName || ""));
   }
-  function showSettings(settings, draft = false) {
-    const panel = root.querySelector(".hp-settings");
-    const luaDir = root.querySelector(".hp-lua-dir");
-    const apiKey = root.querySelector(".hp-api-key");
-    if (!panel || !luaDir || !apiKey) return;
-    panel.dataset.visible = "true";
+  function showSettings(settings, draft = false, reveal = true, anchor = null) {
+    const panel = ensureSettingsPanelLayer(settingsPanel());
+    wireSettingsPopup(panel);
+    const luaDir = panel?.querySelector(".hp-lua-dir");
+    const apiKey = panel?.querySelector(".hp-api-key");
+    const groupLuaToggle = panel?.querySelector(".hp-group-lua-toggle");
+    if (!panel || !luaDir || !apiKey || !groupLuaToggle) return;
+    panel.dataset.visible = reveal ? "true" : "false";
+    const normalizedAnchor = normalizeSettingsAnchor(anchor);
+    if (normalizedAnchor) window.__hubcapSettingsAnchor = normalizedAnchor;
+    if (reveal) window.__hubcapSettingsGloballyVisible = "true";
+    if (reveal) positionSettingsPanel(panel, normalizedAnchor);
+    if (!reveal) {
+      panel.style.removeProperty("display");
+    }
     const missing = !!settings?.configMissing;
-    root.querySelector(".hp-config-missing").dataset.visible = missing ? "true" : "false";
-    root.querySelectorAll(".hp-field").forEach(field => field.style.display = missing ? "none" : "grid");
-    root.querySelector(".hp-settings-actions").style.display = missing ? "none" : "flex";
+    panel.querySelector(".hp-config-missing").dataset.visible = missing ? "true" : "false";
+    panel.querySelectorAll(".hp-field,.hp-toggle-row").forEach(field => field.style.display = missing ? "none" : "");
+    panel.querySelector(".hp-settings-actions").style.display = missing ? "none" : "flex";
     if (missing) {
       luaDir.value = "";
       apiKey.value = "";
       root.dataset.luaDir = "";
       root.dataset.apiKey = "";
+      setGroupLuaEnabled(false);
+      const currentCollection = panel?.querySelector(".hp-current-collection");
+      if (currentCollection) currentCollection.textContent = "";
+      populateCollectionNames([], "");
+      root.dataset.collectionSyncEnabled = "false";
+      root.dataset.collectionName = "";
       setSettingsNote("");
       updateSaveState();
       return;
     }
     luaDir.value = settings?.luaDir || "";
     apiKey.value = settings?.apiKey || "";
+    const collectionName = settings?.collectionName || "";
+    const currentCollection = panel?.querySelector(".hp-current-collection");
+    const availableCollections = settings?.collectionNames || [];
+    populateCollectionNames(availableCollections, collectionName);
+    setGroupLuaEnabled(!!settings?.collectionSyncEnabled);
+    if (currentCollection) currentCollection.textContent = settings?.collectionSyncEnabled ? `Current: ${collectionName || "None"}` : "";
     if (!draft) {
       root.dataset.luaDir = luaDir.value;
       root.dataset.apiKey = apiKey.value;
+      root.dataset.collectionSyncEnabled = String(!!settings?.collectionSyncEnabled);
+      root.dataset.collectionName = collectionName;
     }
     apiKey.type = "password";
     setSettingsNote(settings?.error || "", settings?.error ? "error" : "idle");
@@ -4572,8 +6134,10 @@ static class Scripts
   }
   window.__hubcapCdpSetState = state => {
     placeRoot();
-    const button=root.querySelector(".hp-main"), library=root.querySelector(".hp-library"), status=root.querySelector(".hp-status"), warning=root.querySelector(".hp-warning"), usage=root.querySelector(".hp-usage"), name=root.querySelector(".hp-usage-name"), expiry=root.querySelector(".hp-usage-expiry"), count=root.querySelector(".hp-usage-count"), fill=root.querySelector(".hp-usage-fill"), spinner=root.querySelector(".hp-usage-spinner");
-    if(state.settingsOnly){showSettings(state.settings||{},!!state.settingsDraft);if(state.statusText)setSettingsNote(state.statusText,state.statusTone||"idle");return;}
+    wireTopBarControls();
+    const stats = statsRoot();
+    const button=root.querySelector(".hp-main"), library=root.querySelector(".hp-library"), status=root.querySelector(".hp-status"), warning=root.querySelector(".hp-warning"), usage=stats.querySelector(".hp-usage"), name=stats.querySelector(".hp-usage-name"), expiry=stats.querySelector(".hp-usage-expiry"), count=stats.querySelector(".hp-usage-count"), fill=stats.querySelector(".hp-usage-fill"), spinner=stats.querySelector(".hp-usage-spinner");
+    if(state.settingsOnly){showSettings(state.settings||{},!!state.settingsDraft,!(isSteamShellDocument()&&activeSteamShellTab()==="STORE"),state);if(state.statusText)setSettingsNote(state.statusText,state.statusTone||"idle");return;}
     const denuvo=/denuvo|anti[-\s]?tamper/i.test(document.body?.innerText||"");
     warning.textContent="Warning: Denuvo / 3rd-party anti-tamper detected";
     warning.dataset.visible=denuvo?"true":"false"; button.dataset.denuvo=denuvo?"true":"false";
@@ -4594,28 +6158,48 @@ static class Scripts
       if(cached) window.__hubcapCdpSetState({usageOnly:true,usage:cached});
     }catch{}
   }
+  wireTopBarControls();
   if (!root.dataset.bound) {
-    root.querySelector(".hp-main").addEventListener("click",()=>{const state=root.querySelector(".hp-main").dataset.state;if(state==="download")send("download");if(state==="remove")showRemoveConfirm(()=>send("remove"));});
-    root.querySelector(".hp-library").addEventListener("click",()=>send("library"));
-    root.querySelector(".hp-usage").addEventListener("click",()=>send("refresh"));
-    root.querySelector(".hp-settings-button").addEventListener("click",event=>{event.preventDefault();event.stopPropagation();setSettingsNote("Loading...");root.querySelector(".hp-settings").dataset.visible="true";send("settings");});
-    root.querySelector(".hp-settings").addEventListener("click",event=>event.stopPropagation());
-    root.querySelector(".hp-settings-close").addEventListener("click",event=>{event.preventDefault();event.stopPropagation();root.querySelector(".hp-settings").dataset.visible="false";});
-    root.querySelector(".hp-open-lua-folder").addEventListener("click",event=>{event.preventDefault();event.stopPropagation();setSettingsNote("Selecting Lua folder...");send("openLuaFolder");});
-    root.querySelector(".hp-lua-dir").addEventListener("input",updateSaveState);
-    root.querySelector(".hp-api-key").addEventListener("input",updateSaveState);
-    root.querySelector(".hp-save-settings").addEventListener("click",event=>{event.preventDefault();event.stopPropagation();setSettingsNote("Saving...");send("saveSettings",{luaDir:root.querySelector(".hp-lua-dir").value||"",apiKey:root.querySelector(".hp-api-key").value||""});});
-    root.querySelector(".hp-toggle-api-key").addEventListener("click",event=>{event.preventDefault();event.stopPropagation();const input=root.querySelector(".hp-api-key");input.type=input.type==="password"?"text":"password";});
-    root.querySelector(".hp-copy-api-key").addEventListener("click",async event=>{event.preventDefault();event.stopPropagation();const value=root.querySelector(".hp-api-key").value||"";try{await navigator.clipboard.writeText(value);setSettingsNote("API key copied.");}catch{send("copyApiKey");setSettingsNote("API key copied.");}});
-    document.addEventListener("click",event=>{const panel=root.querySelector(".hp-settings"),button=root.querySelector(".hp-settings-button");if(panel?.dataset.visible==="true"&&!panel.contains(event.target)&&!button?.contains(event.target)&&!hasSettingsChanges())panel.dataset.visible="false";},true);
+    listen(root.querySelector(".hp-main"), "click",()=>{const state=root.querySelector(".hp-main").dataset.state;if(state==="download")send("download");if(state==="remove")showRemoveConfirm(()=>send("remove"));});
+    listen(root.querySelector(".hp-library"), "click",()=>send("library"));
+    const stats = statsRoot();
+    listen(document, "click", event=>{
+      if(event.target.closest?.(".hp-settings-button")){openSettings(event);event.stopImmediatePropagation?.();return;}
+      if(event.target.closest?.(".hp-settings-close")){closeSettings(event);event.stopImmediatePropagation?.();return;}
+      if(event.target.closest?.(`#${TOP_STATS_ID} .hp-usage`) && !event.target.closest?.(".hp-settings")){event.preventDefault();event.stopPropagation();event.stopImmediatePropagation?.();send("refresh");return;}
+    }, { capture: true });
+    listen(document, "click", async event=>{
+      const currentStats=statsRoot();
+      const settingsButton=event.target.closest?.(".hp-settings-button");
+      const settingsPanelHit=event.target.closest?.(".hp-settings");
+      if(settingsButton){openSettings(event);return;}
+      if(event.target.closest?.(".hp-settings-close")){closeSettings(event);return;}
+      if(event.target.closest?.(".hp-open-lua-folder")){event.preventDefault();event.stopPropagation();setSettingsNote("Selecting Lua folder...");send("openLuaFolder");return;}
+      if(event.target.closest?.(".hp-save-settings")){event.preventDefault();event.stopPropagation();saveSettings();return;}
+      if(event.target.closest?.(".hp-remove-collection")){event.preventDefault();event.stopPropagation();removeSelectedCollection();return;}
+      if(event.target.closest?.(".hp-toggle-api-key")){event.preventDefault();event.stopPropagation();const input=settingsPanel()?.querySelector(".hp-api-key");if(input)input.type=input.type==="password"?"text":"password";return;}
+      if(event.target.closest?.(".hp-copy-api-key")){event.preventDefault();event.stopPropagation();const value=settingsPanel()?.querySelector(".hp-api-key").value||"";try{await navigator.clipboard.writeText(value);setSettingsNote("API key copied.");}catch{send("copyApiKey");setSettingsNote("API key copied.");}return;}
+      if(settingsPanelHit){event.stopPropagation();return;}
+      const usageHit=event.target.closest?.(".hp-usage");
+      if(usageHit && !event.target.closest?.(".hp-settings-button,.hp-settings,.hp-icon-button,.hp-save-settings")){event.preventDefault();event.stopPropagation();send("refresh");}
+    });
+    listen(stats.querySelector(".hp-settings-button"), "click", openSettings);
+    listen(stats.querySelector(".hp-lua-dir"), "input", updateSaveState);
+    listen(stats.querySelector(".hp-api-key"), "input", updateSaveState);
+    listen(stats.querySelector(".hp-collection-name"), "change", ()=>{updateGroupLuaNewRow();updateSaveState();});
+    listen(stats.querySelector(".hp-new-collection-name"), "input", updateSaveState);
+    listen(stats.querySelector(".hp-settings-close"), "click", closeSettings);
+    listen(document, "click", event=>{const currentStats=statsRoot(),panel=settingsPanel(),button=currentStats.querySelector(".hp-settings-button"),usage=currentStats.querySelector(".hp-usage"),openedAt=Number(window.__hubcapSettingsOpenedAt||0);if(openedAt&&Date.now()-openedAt<750)return;if(panel?.dataset.visible==="true"&&!panel.contains(event.target)&&!button?.contains(event.target)&&!usage?.contains(event.target)&&!hasSettingsChanges())panel.dataset.visible="false";}, { capture: true });
+    listen(window, "resize", repositionVisibleSettingsPanel);
+    listen(window.visualViewport, "resize", repositionVisibleSettingsPanel);
     root.dataset.bound = "true";
   }
   if(window.__hubcapCdpRouteTimer)clearInterval(window.__hubcapCdpRouteTimer);
   let lastHubcapAppId=appIdFromUrl();
-  window.__hubcapCdpSetState({busy:true,busyText:"Checking...",statusText:"",usageBusy:true});
   hydrateCachedUsage();
-  if(lastHubcapAppId)setTimeout(()=>send("route"),0);
-  window.__hubcapCdpRouteTimer=setInterval(()=>{const nextAppId=appIdFromUrl();placeRoot();if(!nextAppId&&lastHubcapAppId){lastHubcapAppId="";window.__hubcapCdpSetState({busy:true,busyText:"Checking...",statusText:""});return;}if(nextAppId&&nextAppId!==lastHubcapAppId){lastHubcapAppId=nextAppId;send("route");}},150);
+  if(lastHubcapAppId){window.__hubcapCdpSetState({busy:true,busyText:"Checking...",statusText:"",usageBusy:true});setTimeout(()=>send("route"),0);}
+  else if(isSteamShellDocument()){window.__hubcapCdpSetState({usageOnly:true,usageBusy:true});setTimeout(()=>send("usage"),0);}
+  window.__hubcapCdpRouteTimer=setInterval(()=>{const nextAppId=appIdFromUrl();placeRoot();if(!nextAppId&&lastHubcapAppId){lastHubcapAppId="";window.__hubcapCdpSetState({usageOnly:true,usageBusy:false});return;}if(nextAppId&&nextAppId!==lastHubcapAppId){lastHubcapAppId=nextAppId;window.__hubcapCdpSetState({busy:true,busyText:"Checking...",statusText:"",usageBusy:true});send("route");}},150);
   return {ok:true,href:location.href,appId:appIdFromUrl()};
 })()
 """;
@@ -4710,7 +6294,7 @@ static class Scripts
     doc.getElementById(CONFIRM_ID)?.remove();
     const modal = doc.createElement("div");
     modal.id = CONFIRM_ID;
-    modal.innerHTML = `<div class="hpc-box"><div class="hpc-title">Remove Lua?</div><div class="hpc-message"></div><div class="hpc-actions"><button class="hpc-no" type="button">No</button><button class="hpc-yes" type="button">Yes</button></div></div>`;
+    modal.innerHTML = `<div class="hpc-box"><div class="hpc-title">Remove Lua?</div><div class="hpc-message"></div><div class="hpc-actions"><button class="hpc-yes" type="button">Yes</button><button class="hpc-no" type="button">No</button></div></div>`;
     const appId = state.appId || routeAppId();
     const gameName = state.gameName || `app ${appId}`;
     modal.querySelector(".hpc-message").textContent = `Remove Lua for ${gameName}? This will delete the local Lua file.`;
@@ -4741,6 +6325,7 @@ static class Scripts
     const viewportWidth = Math.max(doc.documentElement.clientWidth || 0, desktopWindow()?.innerWidth || 0);
     const viewportHeight = Math.max(doc.documentElement.clientHeight || 0, desktopWindow()?.innerHeight || 0);
     return Array.from(doc.querySelectorAll("button, div, a"))
+      .filter(el => !el.closest?.(".hp-settings,#hubcap-cdp-ui,#hubcap-cdp-top-stats,#hubcap-cdp-library-version-panel,#hubcap-cdp-library-remove-confirm"))
       .map(el => ({ el, r: el.getBoundingClientRect() }))
       .filter(x => x.r.width >= 24 && x.r.width <= 64 && x.r.height >= 24 && x.r.height <= 64)
       .filter(x => x.r.x > viewportWidth * .72 && x.r.y > 260 && x.r.y < Math.min(viewportHeight - 90, 560))
@@ -4750,6 +6335,10 @@ static class Scripts
   function actionRowForAnchor(anchor) {
     let node = anchor?.parentElement || null;
     while (node && node !== anchor.ownerDocument.body) {
+      if (node.closest?.(".hp-settings,#hubcap-cdp-ui,#hubcap-cdp-top-stats,#hubcap-cdp-library-version-panel,#hubcap-cdp-library-remove-confirm")) {
+        node = node.parentElement;
+        continue;
+      }
       const row = node.getBoundingClientRect();
       const compactChildren = Array.from(node.children)
         .map(child => child.getBoundingClientRect())
@@ -4764,6 +6353,7 @@ static class Scripts
     const anchor = actionAnchorElement(doc);
     const row = actionRowForAnchor(anchor);
     if (!anchor || !row) return false;
+    if (row.closest?.(".hp-settings,#hubcap-cdp-ui,#hubcap-cdp-top-stats,#hubcap-cdp-library-version-panel,#hubcap-cdp-library-remove-confirm")) return false;
     element.style.position = "";
     element.style.left = "";
     element.style.top = "";
