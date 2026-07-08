@@ -2874,37 +2874,6 @@ static class WindowOwner
     private static extern IntPtr GetForegroundWindow();
 }
 
-static class MouseInput
-{
-    private const int VkLButton = 0x01;
-
-    public static bool TryGetCursor(out Point point)
-    {
-        if (GetCursorPos(out var nativePoint))
-        {
-            point = new Point(nativePoint.X, nativePoint.Y);
-            return true;
-        }
-
-        point = Point.Empty;
-        return false;
-    }
-
-    public static bool IsLeftDown() => (GetAsyncKeyState(VkLButton) & 0x8000) != 0;
-
-    [DllImport("user32.dll")]
-    private static extern bool GetCursorPos(out NativePoint lpPoint);
-
-    [DllImport("user32.dll")]
-    private static extern short GetAsyncKeyState(int vKey);
-
-    private struct NativePoint
-    {
-        public int X;
-        public int Y;
-    }
-}
-
 sealed class HubcapLauncher
 {
     private readonly HttpClient _http;
@@ -2913,15 +2882,13 @@ sealed class HubcapLauncher
     private readonly ConcurrentDictionary<string, Task<ResolvedApp>> _resolvedApps = new();
     private readonly ConcurrentDictionary<CdpSession, byte> _storeUiSessions = new();
     private readonly ConcurrentDictionary<CdpSession, byte> _storePageSessions = new();
-    private readonly ConcurrentDictionary<CdpSession, byte> _steamShellSessions = new();
+    private readonly ConcurrentDictionary<CdpSession, string> _webPageSurfaces = new();
     private readonly ConcurrentDictionary<CdpSession, byte> _sharedContextSessions = new();
     private readonly TaskCompletionSource _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly SemaphoreSlim _collectionSyncLock = new(1, 1);
     private readonly SemaphoreSlim _settingsOpenLock = new(1, 1);
     private int _lastCollectionSyncVersion = -1;
     private DateTimeOffset _nextCollectionSyncRetryAt = DateTimeOffset.MinValue;
-    private int _topChromeMouseBridgeStarted;
-    private bool _topChromeMouseWasDown;
 
     public Task Ready => _ready.Task;
 
@@ -2934,7 +2901,6 @@ sealed class HubcapLauncher
 
     public async Task RunAsync()
     {
-        StartTopChromeMouseBridge();
         var running = new Dictionary<string, Task>();
         var waitingLogged = false;
         while (true)
@@ -3001,8 +2967,12 @@ sealed class HubcapLauncher
         target.Title.Equals("Steam", StringComparison.OrdinalIgnoreCase) &&
         target.Url.Contains("browserType=4", StringComparison.OrdinalIgnoreCase);
 
+    private static bool IsSteamWebTarget(CdpTarget target) =>
+        target.Url.StartsWith("https://store.steampowered.com/", StringComparison.OrdinalIgnoreCase) ||
+        target.Url.StartsWith("https://steamcommunity.com/", StringComparison.OrdinalIgnoreCase);
+
     private static bool IsStoreUiTarget(CdpTarget target) =>
-        IsStoreTarget(target) || IsSteamShellTarget(target);
+        IsSteamWebTarget(target) || IsSteamShellTarget(target);
 
     private static bool IsLibraryTarget(CdpTarget target) =>
         target.Url.Contains("/library/app/", StringComparison.OrdinalIgnoreCase) ||
@@ -3023,14 +2993,12 @@ sealed class HubcapLauncher
     {
         using var cdp = new CdpSession(target.WebSocketDebuggerUrl);
         var isStoreUiTarget = IsStoreUiTarget(target);
-        var isStorePageTarget = IsStoreTarget(target);
+        var isStorePageTarget = IsSteamWebTarget(target);
         var isSteamShellTarget = IsSteamShellTarget(target);
         if (isStoreUiTarget)
             _storeUiSessions[cdp] = 0;
         if (isStorePageTarget)
             _storePageSessions[cdp] = 0;
-        if (isSteamShellTarget)
-            _steamShellSessions[cdp] = 0;
         if (IsSharedContextTarget(target))
             _sharedContextSessions[cdp] = 0;
         cdp.BindingCalled += (_, payload) => _ = Task.Run(() => HandleEventAsync(cdp, payload));
@@ -3055,7 +3023,7 @@ sealed class HubcapLauncher
             if (isSteamShellTarget)
                 _ = Task.Run(() => RefreshUsageOnlyAsync(cdp, forceRefresh: false));
             if (isStoreUiTarget)
-                _ = Task.Run(() => StoreWatchdogAsync(cdp));
+                _ = Task.Run(() => StoreWatchdogAsync(cdp, isSteamShellTarget));
             else if (IsSharedContextTarget(target))
             {
                 await SyncLuaCollectionAsync(cdp, force: true);
@@ -3069,96 +3037,15 @@ sealed class HubcapLauncher
                 _storeUiSessions.TryRemove(cdp, out _);
             if (isStorePageTarget)
                 _storePageSessions.TryRemove(cdp, out _);
-            if (isSteamShellTarget)
-                _steamShellSessions.TryRemove(cdp, out _);
+            else if (isStoreUiTarget)
+                _storePageSessions.TryRemove(cdp, out _);
+            _webPageSurfaces.TryRemove(cdp, out _);
             if (IsSharedContextTarget(target))
                 _sharedContextSessions.TryRemove(cdp, out _);
         }
     }
 
-    private void StartTopChromeMouseBridge()
-    {
-        if (Interlocked.Exchange(ref _topChromeMouseBridgeStarted, 1) == 1)
-            return;
-
-        _ = Task.Run(TopChromeMouseBridgeAsync);
-    }
-
-    private async Task TopChromeMouseBridgeAsync()
-    {
-        while (SteamLauncher.IsSteamRunning())
-        {
-            try
-            {
-                if (MouseInput.TryGetCursor(out var cursor))
-                {
-                    var leftDown = MouseInput.IsLeftDown();
-                    var clicked = leftDown && !_topChromeMouseWasDown;
-                    _topChromeMouseWasDown = leftDown;
-
-                    if (_steamShellSessions.Count > 0)
-                    {
-                        var payload = JsonSerializer.Serialize(new
-                        {
-                            screenX = cursor.X,
-                            screenY = cursor.Y,
-                            leftDown,
-                            clicked
-                        }, JsonOptions.Default);
-
-                        foreach (var session in _steamShellSessions.Keys.ToList())
-                        {
-                            if (session.IsClosed) continue;
-                            try
-                            {
-                                var result = await session.EvaluateAsync($"window.__hubcapCdpTopStatsPointer && window.__hubcapCdpTopStatsPointer({payload})");
-                                if (TryReadHubcapTopControlResult(result, out _, out var action, out var anchorLeft, out var anchorTop, out var anchorClientLeft, out var anchorClientTop))
-                                {
-                                    if (action == "closeSettings")
-                                        await CloseSettingsPanelsAsync();
-                                    else if (action == "settings")
-                                        await OpenSettingsAsync(session, anchorLeft, anchorTop, anchorClientLeft, anchorClientTop);
-                                }
-                            }
-                            catch
-                            {
-                                // The shell target can disappear while Steam switches views.
-                            }
-                        }
-                    }
-                }
-            }
-            catch
-            {
-                // Cursor forwarding should never interrupt the launcher.
-            }
-
-            await Task.Delay(50);
-        }
-    }
-
-    private static bool TryReadHubcapTopControlResult(JsonObject result, out bool overControls, out string action, out double? anchorLeft, out double? anchorTop, out double? anchorClientLeft, out double? anchorClientTop)
-    {
-        overControls = false;
-        action = "";
-        anchorLeft = null;
-        anchorTop = null;
-        anchorClientLeft = null;
-        anchorClientTop = null;
-        var value = result["result"]?["result"]?["value"]?.AsObject();
-        if (value is null) return false;
-        var overButton = value["overButton"]?.GetValue<bool?>() == true;
-        var overUsage = value["overUsage"]?.GetValue<bool?>() == true;
-        overControls = overButton || overUsage;
-        action = value["action"]?.GetValue<string?>() ?? "";
-        anchorLeft = value["settingsAnchorScreenLeft"]?.GetValue<double?>();
-        anchorTop = value["settingsAnchorScreenTop"]?.GetValue<double?>();
-        anchorClientLeft = value["settingsAnchorClientLeft"]?.GetValue<double?>();
-        anchorClientTop = value["settingsAnchorClientTop"]?.GetValue<double?>();
-        return true;
-    }
-
-    private async Task StoreWatchdogAsync(CdpSession cdp)
+    private async Task StoreWatchdogAsync(CdpSession cdp, bool isSteamShellTarget)
     {
         var lastAppId = "";
         var lastLuaVersion = _hubcap.LuaVersion;
@@ -3166,15 +3053,36 @@ sealed class HubcapLauncher
         {
             try
             {
+                if (isSteamShellTarget)
+                {
+                    var enableShellFallback = !_storePageSessions.Keys.Any(session => !session.IsClosed);
+                    await cdp.EvaluateAsync($"window.__hubcapCdpSetShellFallbackEnabled && window.__hubcapCdpSetShellFallbackEnabled({JsonSerializer.Serialize(enableShellFallback, JsonOptions.Default)})");
+                }
+
                 var probe = await cdp.EvaluateAsync("""
 (() => JSON.stringify({
-  appId: location.pathname.match(/\/app\/(\d+)(?:\/|$)/)?.[1] || "",
+  appId: typeof window.__hubcapCdpGetAppId === "function" ? window.__hubcapCdpGetAppId() : (location.pathname.match(/\/app\/(\d+)(?:\/|$)/)?.[1] || ""),
+  activeSurface: typeof window.__hubcapCdpGetActiveSurface === "function" ? window.__hubcapCdpGetActiveSurface() : "",
+  isStoreDocument: location.hostname === "store.steampowered.com" || location.hostname === "steamcommunity.com",
   hasUi: !!document.getElementById("hubcap-cdp-ui"),
   hasSetter: typeof window.__hubcapCdpSetState === "function"
 }))()
 """);
                 var value = probe["result"]?["result"]?["value"]?.GetValue<string>() ?? "";
                 var state = JsonSerializer.Deserialize<StoreWatchdogState>(value, JsonOptions.Default);
+                if (!isSteamShellTarget)
+                {
+                    if (state is { IsStoreDocument: true, HasUi: true, HasSetter: true })
+                    {
+                        _storePageSessions[cdp] = 0;
+                        _webPageSurfaces[cdp] = string.IsNullOrWhiteSpace(state.ActiveSurface) ? "WEB" : state.ActiveSurface;
+                    }
+                    else
+                    {
+                        _storePageSessions.TryRemove(cdp, out _);
+                        _webPageSurfaces.TryRemove(cdp, out _);
+                    }
+                }
                 if (state is not null && (!state.HasUi || !state.HasSetter))
                 {
                     var inject = await cdp.EvaluateAsync(Scripts.StoreUi);
@@ -3446,11 +3354,11 @@ sealed class HubcapLauncher
             switch (evt.Action)
             {
                 case "toggleSettings":
-                    await ToggleSettingsAsync(cdp, evt.SettingsAnchorScreenLeft, evt.SettingsAnchorScreenTop, evt.SettingsAnchorClientLeft, evt.SettingsAnchorClientTop);
+                    await ToggleSettingsAsync(cdp, evt.SettingsAnchorScreenLeft, evt.SettingsAnchorScreenTop, evt.SettingsAnchorClientLeft, evt.SettingsAnchorClientTop, evt.SettingsPreferSource, evt.SettingsSurface);
                     return;
 
                 case "settings":
-                    await OpenSettingsAsync(cdp, evt.SettingsAnchorScreenLeft, evt.SettingsAnchorScreenTop, evt.SettingsAnchorClientLeft, evt.SettingsAnchorClientTop);
+                    await OpenSettingsAsync(cdp, evt.SettingsAnchorScreenLeft, evt.SettingsAnchorScreenTop, evt.SettingsAnchorClientLeft, evt.SettingsAnchorClientTop, evt.SettingsPreferSource, evt.SettingsSurface);
                     return;
 
                 case "closeSettings":
@@ -3479,9 +3387,13 @@ sealed class HubcapLauncher
                     return;
 
                 case "saveSettings":
+                    var settingsBeforeSave = _hubcap.GetSettings();
+                    var groupLuaChanged =
+                        settingsBeforeSave.CollectionSyncEnabled != evt.CollectionSyncEnabled ||
+                        !string.Equals(settingsBeforeSave.CollectionName, evt.CollectionName, StringComparison.OrdinalIgnoreCase);
                     var savedSettings = _hubcap.SaveSettings(evt.LuaDir, evt.ApiKey, evt.CollectionSyncEnabled, evt.CollectionName);
                     ActionResult? syncResult = null;
-                    if (string.IsNullOrWhiteSpace(savedSettings.Error) && savedSettings.CollectionSyncEnabled)
+                    if (string.IsNullOrWhiteSpace(savedSettings.Error) && savedSettings.CollectionSyncEnabled && groupLuaChanged)
                         syncResult = await SyncLuaCollectionAsync(cdp, force: true);
                     savedSettings.CollectionNames = await LoadCollectionNamesAsync(cdp, savedSettings.CollectionName, includeSelectedFallback: savedSettings.CollectionSyncEnabled && !string.IsNullOrWhiteSpace(savedSettings.CollectionName));
                     var saveError = !string.IsNullOrWhiteSpace(savedSettings.Error);
@@ -3491,7 +3403,7 @@ sealed class HubcapLauncher
                         SettingsOnly = true,
                         Settings = savedSettings,
                         SettingsDraft = saveError || syncError,
-                        StatusText = saveError ? savedSettings.Error : syncError ? $"Saved, but Group Lua failed: {syncResult!.Error}" : savedSettings.CollectionSyncEnabled ? (syncResult?.Error is { Length: > 0 } ? $"Saved. {syncResult.Error}" : "Saved. Group Lua synced.") : "Saved.",
+                        StatusText = saveError ? savedSettings.Error : syncError ? $"Saved, but Group Lua failed: {syncResult!.Error}" : syncResult is not null ? (syncResult.Error is { Length: > 0 } ? $"Saved. {syncResult.Error}" : "Saved. Group Lua synced.") : "Saved.",
                         StatusTone = saveError || syncError ? "error" : "success",
                         StatusError = saveError || syncError
                     };
@@ -3780,6 +3692,7 @@ sealed class HubcapLauncher
             if (ReferenceEquals(session, except) || session.IsClosed) continue;
             try
             {
+                if (!await IsSettingsPanelVisibleAsync(session)) continue;
                 await SetStateAsync(session, state);
             }
             catch
@@ -3789,6 +3702,14 @@ sealed class HubcapLauncher
         }
     }
 
+    private static async Task<bool> IsSettingsPanelVisibleAsync(CdpSession session)
+    {
+        var probe = await session.EvaluateAsync("""
+(() => Array.from(document.querySelectorAll(".hp-settings")).some(panel => panel.dataset.visible === "true"))()
+""");
+        return probe["result"]?["result"]?["value"]?.GetValue<bool?>() == true;
+    }
+
     private async Task<bool> AnySettingsPanelOpenAsync()
     {
         foreach (var session in _storeUiSessions.Keys.ToList())
@@ -3796,10 +3717,7 @@ sealed class HubcapLauncher
             if (session.IsClosed) continue;
             try
             {
-                var probe = await session.EvaluateAsync("""
-(() => Array.from(document.querySelectorAll(".hp-settings")).some(panel => panel.dataset.visible === "true"))()
-""");
-                if (probe["result"]?["result"]?["value"]?.GetValue<bool?>() == true)
+                if (await IsSettingsPanelVisibleAsync(session))
                     return true;
             }
             catch
@@ -3809,6 +3727,30 @@ sealed class HubcapLauncher
         }
 
         return false;
+    }
+
+    private List<CdpSession> LiveStorePageSessions() =>
+        _storePageSessions.Keys.Where(session => !session.IsClosed).ToList();
+
+    private CdpSession SettingsTargetFor(CdpSession source, bool preferSource = false, string desiredSurface = "")
+    {
+        if (preferSource)
+            return source;
+
+        if (_storePageSessions.ContainsKey(source) && !source.IsClosed)
+            return source;
+
+        if (!string.IsNullOrWhiteSpace(desiredSurface))
+        {
+            var matchingWebPage = _storePageSessions.Keys
+                .Where(session => !session.IsClosed)
+                .FirstOrDefault(session => _webPageSurfaces.TryGetValue(session, out var surface) && string.Equals(surface, desiredSurface, StringComparison.OrdinalIgnoreCase));
+            if (matchingWebPage is not null)
+                return matchingWebPage;
+        }
+
+        var liveStorePage = LiveStorePageSessions().FirstOrDefault();
+        return liveStorePage ?? source;
     }
 
     private async Task CloseSettingsPanelsAsync()
@@ -3836,7 +3778,7 @@ sealed class HubcapLauncher
         }
     }
 
-    private async Task ToggleSettingsAsync(CdpSession source, double? anchorLeft = null, double? anchorTop = null, double? anchorClientLeft = null, double? anchorClientTop = null)
+    private async Task ToggleSettingsAsync(CdpSession source, double? anchorLeft = null, double? anchorTop = null, double? anchorClientLeft = null, double? anchorClientTop = null, bool preferSource = false, string desiredSurface = "")
     {
         if (await AnySettingsPanelOpenAsync())
         {
@@ -3844,16 +3786,21 @@ sealed class HubcapLauncher
             return;
         }
 
-        await OpenSettingsAsync(source, anchorLeft, anchorTop, anchorClientLeft, anchorClientTop);
+        await OpenSettingsAsync(source, anchorLeft, anchorTop, anchorClientLeft, anchorClientTop, preferSource, desiredSurface);
     }
 
-    private async Task OpenSettingsAsync(CdpSession source, double? anchorLeft = null, double? anchorTop = null, double? anchorClientLeft = null, double? anchorClientTop = null)
+    private async Task OpenSettingsAsync(CdpSession source, double? anchorLeft = null, double? anchorTop = null, double? anchorClientLeft = null, double? anchorClientTop = null, bool preferSource = false, string desiredSurface = "")
     {
         if (!await _settingsOpenLock.WaitAsync(TimeSpan.FromSeconds(1)))
             return;
 
         try
         {
+            var target = SettingsTargetFor(source, preferSource, desiredSurface);
+            var useSourceAnchor = ReferenceEquals(target, source);
+            if (!useSourceAnchor)
+                await CloseSettingsPanelsAsync();
+
             var settings = _hubcap.GetSettings();
             settings.CollectionNames = string.IsNullOrWhiteSpace(settings.CollectionName) ? [] : [settings.CollectionName];
             var initialState = new UiState
@@ -3862,26 +3809,26 @@ sealed class HubcapLauncher
                 Settings = settings,
                 SettingsAnchorScreenLeft = anchorLeft,
                 SettingsAnchorScreenTop = anchorTop,
-                SettingsAnchorClientLeft = anchorClientLeft,
-                SettingsAnchorClientTop = anchorClientTop
+                SettingsAnchorClientLeft = useSourceAnchor ? anchorClientLeft : null,
+                SettingsAnchorClientTop = useSourceAnchor ? anchorClientTop : null
             };
-            await SetStateAsync(source, initialState);
-            await BroadcastSettingsAsync(initialState, except: source);
+            await SetStateAsync(target, initialState);
+            await BroadcastSettingsAsync(initialState, except: target);
             try
             {
                 settings = _hubcap.GetSettings();
-                settings.CollectionNames = await LoadCollectionNamesAsync(source, settings.CollectionName, includeSelectedFallback: !string.IsNullOrWhiteSpace(settings.CollectionName));
+                settings.CollectionNames = await LoadCollectionNamesAsync(target, settings.CollectionName, includeSelectedFallback: !string.IsNullOrWhiteSpace(settings.CollectionName));
                 var state = new UiState
                 {
                     SettingsOnly = true,
                     Settings = settings,
                     SettingsAnchorScreenLeft = anchorLeft,
                     SettingsAnchorScreenTop = anchorTop,
-                    SettingsAnchorClientLeft = anchorClientLeft,
-                    SettingsAnchorClientTop = anchorClientTop
+                    SettingsAnchorClientLeft = useSourceAnchor ? anchorClientLeft : null,
+                    SettingsAnchorClientTop = useSourceAnchor ? anchorClientTop : null
                 };
-                await SetStateAsync(source, state);
-                await BroadcastSettingsAsync(state, except: source);
+                await SetStateAsync(target, state);
+                await BroadcastSettingsAsync(state, except: target);
             }
             catch (Exception ex)
             {
@@ -5136,12 +5083,14 @@ sealed record HubcapEvent(
     string BuildId = "",
     string Date = "",
     string Label = "",
+    bool SettingsPreferSource = false,
+    string SettingsSurface = "",
     double? SettingsAnchorScreenLeft = null,
     double? SettingsAnchorScreenTop = null,
     double? SettingsAnchorClientLeft = null,
     double? SettingsAnchorClientTop = null,
     List<LuaManifestOptionState>? Options = null);
-sealed record StoreWatchdogState(string AppId, bool HasUi, bool HasSetter);
+sealed record StoreWatchdogState(string AppId, string ActiveSurface, bool IsStoreDocument, bool HasUi, bool HasSetter);
 
 sealed record ConfigSource(string Path, ConfigSourceKind Kind);
 
@@ -5506,12 +5455,14 @@ static class Scripts
   const CONFIRM_ID = "hubcap-cdp-remove-confirm";
   const STYLE_ID = "hubcap-cdp-ui-style";
   const USAGE_CACHE_KEY = "hubcap-cdp-usage-cache";
-  const UI_VERSION = "2026-07-08-settings-click-placement-fix";
+  const UI_VERSION = "2026-07-09-trash-remove-collection";
   const STATS_Z_INDEX = 2147483647;
+  delete window.__hubcapCdpTopStatsPointer;
   document.getElementById(STYLE_ID)?.remove();
   if (window.__hubcapCdpController) {
     try { window.__hubcapCdpController.abort(); } catch {}
   }
+  document.querySelectorAll("[data-hubcap-launcher-settings-nav='true']").forEach(nav => { delete nav.dataset.hubcapLauncherSettingsBoundVersion; });
   const controller = new AbortController();
   window.__hubcapCdpController = controller;
   const listen = (target, type, handler, options = {}) => target?.addEventListener?.(type, handler, { ...options, signal: controller.signal });
@@ -5523,21 +5474,22 @@ static class Scripts
     #${ROOT_ID} .hp-left{flex:1 1 auto;min-height:34px}
     #${ROOT_ID} .hp-right{flex:0 0 auto;margin-left:auto;position:relative}
     #${TOP_STATS_ID}{background:transparent;border:0;box-sizing:border-box;color:inherit;height:auto;margin:0;overflow:visible;padding:0;position:relative;width:max-content}
-    #${TOP_STATS_ID}[data-shell="true"],#${TOP_STATS_ID}[data-store="true"]{align-items:center;display:flex!important;margin-left:auto;pointer-events:auto;position:fixed!important;right:8px;z-index:${STATS_Z_INDEX}!important}
-    #${TOP_STATS_ID}[data-shell="true"]{right:370px;top:8px}
-    #${TOP_STATS_ID}[data-store="true"]{top:8px}
     #${TOP_STATS_ID}[data-hidden="true"]{opacity:0!important;pointer-events:none!important;visibility:hidden!important}
-    #${ROOT_ID} button{align-items:center;background:rgba(13,27,39,.48);border:1px solid rgba(103,193,245,.26);border-radius:3px;box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 1px 2px rgba(0,0,0,.24);color:#d6f4ff;cursor:pointer;display:inline-flex;font:14px Arial,Helvetica,sans-serif;height:32px;justify-content:center;line-height:1;min-height:32px;min-width:124px;padding:0 14px;text-align:center;white-space:nowrap}
-    #${ROOT_ID} button:hover{background:rgba(26,52,70,.62);border-color:rgba(103,193,245,.42);color:#fff}
-    #${ROOT_ID} button:disabled{cursor:default;opacity:.72}
-    #${ROOT_ID} button[data-state="checking"],#${ROOT_ID} button[data-busy="true"]{align-items:center;display:inline-flex;gap:8px}
-    #${ROOT_ID} button[data-state="checking"]::before,#${ROOT_ID} button[data-busy="true"]::before{animation:hubcap-cdp-spin .8s linear infinite;border:2px solid rgba(214,244,255,.35);border-top-color:#d6f4ff;border-radius:50%;content:"";height:12px;width:12px}
-    #${ROOT_ID} button[data-state="download"][data-denuvo="true"]{background:rgba(111,60,24,.58);border-color:rgba(246,162,58,.36);color:#ffe7c1;opacity:1}
-    #${ROOT_ID} button[data-state="download"][data-denuvo="true"]:hover{background:rgba(129,72,30,.72);border-color:rgba(246,162,58,.5);color:#fff5e6}
-    #${ROOT_ID} button[data-state="remove"]{background:rgba(95,33,31,.58);border-color:rgba(217,75,63,.36);color:#ffe0dc;opacity:1}
-    #${ROOT_ID} button[data-state="remove"]:hover{background:rgba(112,42,39,.72);border-color:rgba(217,75,63,.5);color:#fff1ef}
-    #${ROOT_ID} button[data-state="disabled"]{background:rgba(13,27,39,.32);border-color:rgba(180,198,210,.18);color:rgba(214,244,255,.56);opacity:1}
-    #${ROOT_ID} button[data-state="disabled"]:hover{background:rgba(13,27,39,.32);border-color:rgba(180,198,210,.18);color:rgba(214,244,255,.56)}
+    #${TOP_STATS_ID}[data-shell-global="true"]{display:flex!important;gap:8px;pointer-events:none;position:fixed!important;z-index:${STATS_Z_INDEX}!important}
+    #${TOP_STATS_ID}[data-shell-global="true"] .hp-settings-button{display:none!important}
+    #${TOP_STATS_ID}[data-web-hidden="true"]{display:none!important}
+    #${ROOT_ID}[data-web-document="true"] .hp-settings-button{display:none!important}
+    #${ROOT_ID} .hp-main,#${ROOT_ID} .hp-library{align-items:center;background:rgba(13,27,39,.48);border:1px solid rgba(103,193,245,.26);border-radius:3px;box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 1px 2px rgba(0,0,0,.24);color:#d6f4ff;cursor:pointer;display:inline-flex;font:14px Arial,Helvetica,sans-serif;height:32px;justify-content:center;line-height:1;min-height:32px;min-width:124px;padding:0 14px;text-align:center;white-space:nowrap}
+    #${ROOT_ID} .hp-main:hover,#${ROOT_ID} .hp-library:hover{background:rgba(26,52,70,.62);border-color:rgba(103,193,245,.42);color:#fff}
+    #${ROOT_ID} .hp-main:disabled,#${ROOT_ID} .hp-library:disabled{cursor:default;opacity:.72}
+    #${ROOT_ID} .hp-main[data-state="checking"],#${ROOT_ID} .hp-main[data-busy="true"]{align-items:center;display:inline-flex;gap:8px}
+    #${ROOT_ID} .hp-main[data-state="checking"]::before,#${ROOT_ID} .hp-main[data-busy="true"]::before{animation:hubcap-cdp-spin .8s linear infinite;border:2px solid rgba(214,244,255,.35);border-top-color:#d6f4ff;border-radius:50%;content:"";height:12px;width:12px}
+    #${ROOT_ID} .hp-main[data-state="download"][data-denuvo="true"]{background:rgba(111,60,24,.58);border-color:rgba(246,162,58,.36);color:#ffe7c1;opacity:1}
+    #${ROOT_ID} .hp-main[data-state="download"][data-denuvo="true"]:hover{background:rgba(129,72,30,.72);border-color:rgba(246,162,58,.5);color:#fff5e6}
+    #${ROOT_ID} .hp-main[data-state="remove"]{background:rgba(95,33,31,.58);border-color:rgba(217,75,63,.36);color:#ffe0dc;opacity:1}
+    #${ROOT_ID} .hp-main[data-state="remove"]:hover{background:rgba(112,42,39,.72);border-color:rgba(217,75,63,.5);color:#fff1ef}
+    #${ROOT_ID} .hp-main[data-state="disabled"]{background:rgba(13,27,39,.32);border-color:rgba(180,198,210,.18);color:rgba(214,244,255,.56);opacity:1}
+    #${ROOT_ID} .hp-main[data-state="disabled"]:hover{background:rgba(13,27,39,.32);border-color:rgba(180,198,210,.18);color:rgba(214,244,255,.56)}
     #${ROOT_ID} .hp-status{color:#acdbf5;font:12px Arial,Helvetica,sans-serif;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     #${ROOT_ID} .hp-status[data-tone="error"]{color:#ff9b8f;font-weight:700}
     #${ROOT_ID} .hp-status[data-tone="success"]{color:#a4d007;font-weight:700}
@@ -5564,8 +5516,8 @@ static class Scripts
     .hubcap-cdp-stats .hp-usage-expiry{color:#9fc9e0;font-size:11px}
     .hubcap-cdp-stats .hp-usage-bar{background:rgba(0,0,0,.26);border-radius:999px;height:4px;margin-top:6px;overflow:hidden}
     .hubcap-cdp-stats .hp-usage-fill{background:linear-gradient(90deg,#a4d007 0%,#67c1f5 100%);display:block;height:100%;width:0%}
-    .hubcap-cdp-stats .hp-usage-spinner{animation:hubcap-cdp-spin .8s linear infinite;border:2px solid rgba(214,244,255,.28);border-top-color:#d6f4ff;border-radius:50%;display:none;height:10px;width:10px}
-    .hubcap-cdp-stats .hp-usage-spinner[data-visible="true"]{display:inline-flex}
+    .hubcap-cdp-stats .hp-usage-spinner{animation:hubcap-cdp-spin .8s linear infinite;border:2px solid rgba(214,244,255,.28);border-top-color:#d6f4ff;border-radius:50%;box-sizing:border-box;display:inline-flex;flex:0 0 10px;height:10px;opacity:0;visibility:hidden;width:10px}
+    .hubcap-cdp-stats .hp-usage-spinner[data-visible="true"]{opacity:1;visibility:visible}
     .hp-settings-button{align-items:center;background:rgba(13,27,39,.78);border:1px solid rgba(103,193,245,.32);border-radius:3px;box-shadow:0 8px 22px rgba(0,0,0,.34);box-sizing:border-box;color:#9fc9e0;cursor:pointer;display:inline-flex;font:13px Arial,Helvetica,sans-serif;height:24px;justify-content:center;min-height:24px;min-width:28px;padding:0;transition:background .12s ease,border-color .12s ease,box-shadow .12s ease,color .12s ease;width:28px}
     .hp-settings-button:hover,.hp-settings-button[data-hover="true"]{background:rgba(26,52,70,.82);border-color:rgba(103,193,245,.58);color:#fff;box-shadow:0 0 8px rgba(103,193,245,.18)}
     .hp-settings-button:active,.hp-settings-button[data-pressed="true"]{background:rgba(18,38,53,.94);border-color:rgba(103,193,245,.76);box-shadow:0 0 0 1px rgba(103,193,245,.24),inset 0 1px 4px rgba(0,0,0,.34);color:#fff}
@@ -5596,11 +5548,11 @@ static class Scripts
     .hp-group-lua-options[data-visible="true"]{display:grid}
     .hp-new-collection-row{display:none}
     .hp-new-collection-row[data-visible="true"]{display:flex}
-    .hp-remove-collection{color:#ffb3aa}
-    .hp-remove-collection:hover{background:rgba(95,33,31,.68);border-color:rgba(217,75,63,.48);color:#fff1ef}
     .hp-remove-collection[data-visible="false"]{display:none}
     .hp-icon-button{align-items:center;background:rgba(13,27,39,.48);border:1px solid rgba(103,193,245,.26);border-radius:3px;color:#d6f4ff;cursor:pointer;display:inline-flex;font:13px Arial,Helvetica,sans-serif;height:28px;justify-content:center;min-height:28px;min-width:30px;padding:0;width:30px}
     .hp-icon-button:hover{background:rgba(26,52,70,.62);border-color:rgba(103,193,245,.42);color:#fff}
+    .hp-icon-button.hp-remove-collection{background:rgba(95,33,31,.82);border-color:rgba(217,75,63,.62);color:#ffe0dc;font-size:15px}
+    .hp-icon-button.hp-remove-collection:hover{background:rgba(128,39,34,.94);border-color:rgba(255,118,105,.82);color:#fff}
     .hp-config-missing{display:none;gap:10px;margin-top:8px}
     .hp-config-missing[data-visible="false"]{display:none!important}
     .hp-config-missing[data-visible="true"]{display:grid}
@@ -5636,23 +5588,33 @@ static class Scripts
     document.querySelectorAll(".hp-settings").forEach(panel => { if (!root.contains(panel)) panel.remove(); });
     root.innerHTML = `
     <div class="hp-left"><button class="hp-main" type="button" data-state="checking" disabled>Checking...</button><button class="hp-library" type="button" style="display:none">Go to Library</button><span class="hp-status"></span><span class="hp-warning"></span></div>
-    <div class="hp-right hubcap-cdp-stats" id="${TOP_STATS_ID}"><button class="hp-settings-button" type="button" title="Hubcap settings">&#9881;</button><div class="hp-usage" title="Refresh usage"><div class="hp-usage-row"><span class="hp-usage-name">Hubcap</span><span class="hp-usage-expiry">Expires --</span></div><div class="hp-usage-bar"><span class="hp-usage-fill"></span></div><div class="hp-usage-bottom"><span class="hp-usage-count-wrap">Daily Usage: <strong class="hp-usage-count">--/--</strong><span class="hp-usage-spinner"></span></span></div></div><div class="hp-settings"><div class="hp-settings-head"><span>Hubcap Settings</span><button class="hp-settings-close" type="button" title="Close">&times;</button></div><div class="hp-config-missing"><div class="hp-config-missing-text">Config file not found. Make sure HubcapTools is installed.</div></div><div class="hp-field"><label>Lua Folder</label><div class="hp-field-row"><input class="hp-lua-dir" type="text"><button class="hp-icon-button hp-open-lua-folder" type="button" title="Select Lua folder">&#128193;</button></div></div><div class="hp-field"><label>API Key</label><div class="hp-field-row"><input class="hp-api-key" type="password"><button class="hp-icon-button hp-toggle-api-key" type="button" title="Show API key">&#128065;</button><button class="hp-icon-button hp-copy-api-key" type="button" title="Copy API key">&#128203;</button></div></div><div class="hp-toggle-row hp-group-lua-row"><span class="hp-toggle-label">Group Lua <span class="hp-current-collection"></span></span><button class="hp-group-lua-toggle" type="button" data-on="false" title="Group Lua"></button></div><div class="hp-field hp-group-lua-options"><label>Collection</label><div class="hp-field-row"><select class="hp-collection-name"></select><button class="hp-icon-button hp-remove-collection" type="button" title="Remove selected collection">&times;</button></div><div class="hp-field-row hp-new-collection-row"><input class="hp-new-collection-name" type="text" placeholder="New collection name"></div></div><div class="hp-settings-note"></div><div class="hp-settings-actions"><button class="hp-save-settings" type="button">Save</button></div></div></div>`;
+    <div class="hp-right hubcap-cdp-stats" id="${TOP_STATS_ID}"><button class="hp-settings-button" type="button" title="Hubcap settings">&#9881;</button><div class="hp-usage" title="Refresh usage"><div class="hp-usage-row"><span class="hp-usage-name">Hubcap</span><span class="hp-usage-expiry">Expires --</span></div><div class="hp-usage-bar"><span class="hp-usage-fill"></span></div><div class="hp-usage-bottom"><span class="hp-usage-count-wrap">Daily Usage: <strong class="hp-usage-count">--/--</strong><span class="hp-usage-spinner"></span></span></div></div><div class="hp-settings"><div class="hp-settings-head"><span>Hubcap Settings</span><button class="hp-settings-close" type="button" title="Close">&times;</button></div><div class="hp-config-missing"><div class="hp-config-missing-text">Config file not found. Make sure HubcapTools is installed.</div></div><div class="hp-field"><label>Lua Folder</label><div class="hp-field-row"><input class="hp-lua-dir" type="text"><button class="hp-icon-button hp-open-lua-folder" type="button" title="Select Lua folder">&#128193;</button></div></div><div class="hp-field"><label>API Key</label><div class="hp-field-row"><input class="hp-api-key" type="password"><button class="hp-icon-button hp-toggle-api-key" type="button" title="Show API key">&#128065;</button><button class="hp-icon-button hp-copy-api-key" type="button" title="Copy API key">&#128203;</button></div></div><div class="hp-toggle-row hp-group-lua-row"><span class="hp-toggle-label">Group Lua <span class="hp-current-collection"></span></span><button class="hp-group-lua-toggle" type="button" data-on="false" title="Group Lua"></button></div><div class="hp-field hp-group-lua-options"><label>Collection</label><div class="hp-field-row"><select class="hp-collection-name"></select><button class="hp-icon-button hp-remove-collection" type="button" title="Remove selected collection" aria-label="Remove selected collection">&#128465;</button></div><div class="hp-field-row hp-new-collection-row"><input class="hp-new-collection-name" type="text" placeholder="New collection name"></div></div><div class="hp-settings-note"></div><div class="hp-settings-actions"><button class="hp-save-settings" type="button">Save</button></div></div></div>`;
   }
   const appIdFromText = value => (String(value || "").match(/\/app\/(\d+)(?:\/|$)/)?.[1] || String(value || "").match(/store\.steampowered\.com\/app\/(\d+)(?:\/|$)/)?.[1] || "");
-  const appIdFromUrl = () => appIdFromText(location.href) || appIdFromText(location.pathname) || appIdFromText(document.URL) || appIdFromText(document.querySelector('link[rel="canonical"]')?.href) || appIdFromText(document.querySelector('meta[property="og:url"]')?.content) || appIdFromText(globalThis.MainWindowBrowserManager?.m_lastLocation?.pathname || "") || appIdFromText(globalThis.MainWindowBrowserManager?.m_lastLocation?.href || "");
+  const appIdFromUrl = () => appIdFromText(location.href) || appIdFromText(location.pathname) || appIdFromText(document.URL) || appIdFromText(document.querySelector('link[rel="canonical"]')?.href) || appIdFromText(document.querySelector('meta[property="og:url"]')?.content) || appIdFromText(globalThis.MainWindowBrowserManager?.m_lastLocation?.pathname || "") || appIdFromText(globalThis.MainWindowBrowserManager?.m_lastLocation?.href || "") || appIdFromText(document.body?.innerText || "");
+  window.__hubcapCdpGetAppId = appIdFromUrl;
+  window.__hubcapCdpShellFallbackEnabled = window.__hubcapCdpShellFallbackEnabled === true;
+  window.__hubcapCdpSetShellFallbackEnabled = enabled => {
+    window.__hubcapCdpShellFallbackEnabled = !!enabled;
+    placeRoot();
+  };
   const statsRoot = () => document.getElementById(TOP_STATS_ID) || root.querySelector(`#${TOP_STATS_ID}`) || root;
   const settingsPanel = () => document.querySelector('.hp-settings[data-hubcap-settings="true"]') || statsRoot()?.querySelector?.(".hp-settings") || root.querySelector(".hp-settings");
   function headerHost(){return document.querySelector(".apphub_HeaderStandardTop") || document.querySelector(".apphub_AppName")?.parentElement || null;}
   function earlyHost(){return headerHost() || document.querySelector("#game_highlights")?.parentElement || document.querySelector(".game_page_background") || document.querySelector(".game_background_glow") || null;}
   function looksLikeAppPage(){return !!(appIdFromUrl()||headerHost()||document.querySelector("#game_highlights")||document.querySelector(".game_page_background"));}
   function isStoreDocument(){return location.hostname === "store.steampowered.com";}
+  function isSteamCommunityDocument(){return location.hostname === "steamcommunity.com";}
+  function isSteamWebDocument(){return isStoreDocument() || isSteamCommunityDocument();}
   function isSteamShellDocument(){return document.title === "Steam" && /STORE\s*LIBRARY\s*COMMUNITY/i.test(document.body?.innerText || "");}
-  function activeSteamShellTab(){
-    if(!isSteamShellDocument()) return "";
-    const labels=Array.from(document.querySelectorAll("div,span"))
-      .map(element=>({element,text:(element.innerText||element.textContent||"").trim(),rect:element.getBoundingClientRect(),color:getComputedStyle(element).color}))
-      .filter(item=>["STORE","LIBRARY","COMMUNITY","OOGIEFIED","CONSOLE"].includes(item.text)&&item.rect.y>=30&&item.rect.y<=70);
-    return labels.find(item=>/rgb\(\s*26\s*,\s*159\s*,\s*255\s*\)/i.test(item.color))?.text||"";
+  function shellContentHost(){
+    if (!isSteamShellDocument()) return null;
+    const hosts = Array.from(document.querySelectorAll("main,section,div"))
+      .filter(element => !element.closest?.(`#${ROOT_ID}`) && element !== document.body)
+      .map(element => ({ element, rect: element.getBoundingClientRect(), text: element.innerText || element.textContent || "" }))
+      .filter(item => item.rect.width >= 640 && item.rect.height >= 220 && item.rect.top >= 60 && item.rect.top <= 160 && /store\.steampowered\.com/i.test(item.text))
+      .sort((a,b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+    return hosts[0]?.element || null;
   }
   function closeSettings(event) {
     event?.preventDefault?.();
@@ -5710,7 +5672,7 @@ static class Scripts
   function ensureSettingsPanelLayer(panel = settingsPanel()) {
     if (!panel) return null;
     panel.dataset.hubcapSettings = "true";
-    const floating = isSteamShellDocument() || isStoreDocument();
+    const floating = isSteamWebDocument() || isSteamShellDocument();
     panel.dataset.floating = floating ? "true" : "false";
     if (floating && panel.parentElement !== document.body) document.body.appendChild(panel);
     wireSettingsDrag(panel);
@@ -5741,12 +5703,12 @@ static class Scripts
     if (toggle) toggle.onclick = event => { event.preventDefault(); event.stopPropagation(); const input = settingsPanel()?.querySelector(".hp-api-key"); if (input) input.type = input.type === "password" ? "text" : "password"; };
     if (copy) copy.onclick = async event => { event.preventDefault(); event.stopPropagation(); const value = settingsPanel()?.querySelector(".hp-api-key").value || ""; try { await navigator.clipboard.writeText(value); setSettingsNote("API key copied."); } catch { send("copyApiKey"); setSettingsNote("API key copied."); } };
   }
-  function revealSettingsPopup() {
+  function revealSettingsPopup(anchor = null) {
     const panel = ensureSettingsPanelLayer(settingsPanel());
     if (!panel) return null;
     wireSettingsPopup(panel);
     panel.dataset.visible = "true";
-    positionSettingsPanel(panel, currentSettingsAnchor());
+    positionSettingsPanel(panel, anchor || currentSettingsAnchor());
     return panel;
   }
   function repositionVisibleSettingsPanel() {
@@ -5765,6 +5727,16 @@ static class Scripts
       settingsAnchorScreenTop: window.screenY + statsRect.bottom + 8,
       settingsAnchorClientLeft: targetRect.left,
       settingsAnchorClientTop: statsRect.bottom + 8
+    };
+  }
+  function settingsAnchorForElement(element) {
+    const rect = element?.getBoundingClientRect?.();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+    return {
+      settingsAnchorScreenLeft: window.screenX + rect.left,
+      settingsAnchorScreenTop: window.screenY + rect.bottom + 8,
+      settingsAnchorClientLeft: rect.left,
+      settingsAnchorClientTop: rect.bottom + 8
     };
   }
   function normalizeSettingsAnchor(anchor) {
@@ -5802,13 +5774,16 @@ static class Scripts
     const top = hasAnchor ? rect.bottom + 8 : isStoreDocument() ? 40 : 100;
     clampSettingsPanel(panel, left, top);
   }
-  function openSettings(event) {
+  function openSettings(event, extra = {}) {
     event?.preventDefault?.();
     event?.stopPropagation?.();
     if (event?.__hubcapSettingsHandled) return "";
     if (event) event.__hubcapSettingsHandled = true;
     window.__hubcapSettingsOpenedAt=Date.now();
     const panel = settingsPanel();
+    if (panel?.dataset.visible !== "true" && window.__hubcapSettingsGloballyVisible === "true") {
+      window.__hubcapSettingsGloballyVisible = "false";
+    }
     if (panel?.dataset.visible === "true" || window.__hubcapSettingsGloballyVisible === "true") {
       closeSettings(event);
       if (!event) send("closeSettings");
@@ -5820,7 +5795,7 @@ static class Scripts
     if (anchor) window.__hubcapSettingsAnchor = anchor;
     revealSettingsPopup();
     setSettingsNote("Loading...");
-    send("settings", anchor || {});
+    send("settings", { ...(anchor || {}), ...extra });
     return "settings";
   }
   function setPressableState(element, hover = null, pressed = null) {
@@ -5847,99 +5822,162 @@ static class Scripts
       element.addEventListener("click", event => onActivate?.(event), { capture: true });
     }
   }
-  function updateTopBarPointerState(clientX, clientY) {
-    const stats = statsRoot();
-    if (!stats || stats === root || !Number.isFinite(clientX) || !Number.isFinite(clientY)) return;
-    const hit = document.elementFromPoint(clientX, clientY);
-    const button = stats.querySelector(".hp-settings-button");
-    const usage = stats.querySelector(".hp-usage");
-    const overButton = !!hit?.closest?.(".hp-settings-button");
-    const overUsage = !overButton && !!hit?.closest?.(".hp-usage");
-    setPressableState(button, overButton, null);
-    setPressableState(usage, overUsage, null);
-  }
-  function wireTopBarPointerTracking() {
-    if (window.__hubcapTopBarPointerTracking === "true") return;
-    window.__hubcapTopBarPointerTracking = "true";
-    const move = event => updateTopBarPointerState(event.clientX, event.clientY);
-    const clear = () => {
-      const stats = statsRoot();
-      setPressableState(stats?.querySelector(".hp-settings-button"), false, false);
-      setPressableState(stats?.querySelector(".hp-usage"), false, false);
-    };
-    document.addEventListener("mousemove", move, true);
-    document.addEventListener("pointermove", move, true);
-    document.addEventListener("mouseout", event => { if (!event.relatedTarget) clear(); }, true);
-    window.addEventListener("blur", clear, true);
-  }
-  function wireTopBarControls() {
+  function wireStatsControls() {
     const stats = statsRoot();
     if (!stats || stats === root) return;
-    wireTopBarPointerTracking();
     wirePressable(stats.querySelector(".hp-settings-button"), event => {
       openSettings(event);
       event?.stopImmediatePropagation?.();
     });
     wirePressable(stats.querySelector(".hp-usage"), null);
   }
-  window.__hubcapCdpTopStatsPointer = state => {
-    const stats = statsRoot();
-    if (!stats || stats === root || stats.dataset.shell !== "true") return { ok: false };
-    const button = stats.querySelector(".hp-settings-button");
-    const usage = stats.querySelector(".hp-usage");
-    if (!button || !usage) return { ok: false };
-    const x = Number(state?.screenX ?? NaN) - window.screenX;
-    const y = Number(state?.screenY ?? NaN) - window.screenY;
-    if (!Number.isFinite(x) || !Number.isFinite(y)) return { ok: false };
-    const inside = rect => x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
-    const overButton = inside(button.getBoundingClientRect());
-    const overUsage = !overButton && inside(usage.getBoundingClientRect());
-    const leftDown = !!state?.leftDown;
-    setPressableState(button, overButton, overButton && leftDown);
-    setPressableState(usage, overUsage, overUsage && leftDown);
-    if (state?.clicked && overButton) {
-      const action = openSettings();
-      const anchor = window.__hubcapSettingsAnchor || currentSettingsAnchor();
-      return { ok: true, action, overButton, overUsage, settingsAnchorScreenLeft: anchor?.settingsAnchorScreenLeft, settingsAnchorScreenTop: anchor?.settingsAnchorScreenTop, settingsAnchorClientLeft: anchor?.settingsAnchorClientLeft, settingsAnchorClientTop: anchor?.settingsAnchorClientTop };
-    }
-    if (state?.clicked && overUsage) {
-      send("refresh");
-      return { ok: true, action: "refresh", overButton, overUsage };
-    }
-    return { ok: true, action: "", overButton, overUsage };
-  };
-  function shellTopBarHost() {
+  function findConsoleNavElement() {
     if (!isSteamShellDocument()) return null;
-    const labels = Array.from(document.querySelectorAll("div,span,a,button"))
-      .map(element => ({ element, text: (element.innerText || element.textContent || "").trim(), rect: element.getBoundingClientRect() }))
-      .filter(item => ["STORE","LIBRARY","COMMUNITY"].includes(item.text) && item.rect.top >= 20 && item.rect.top <= 80);
-    if (labels.length < 2) return null;
-    const first = labels[0].element;
-    for (let node = first.parentElement; node && node !== document.body; node = node.parentElement) {
+    const exact = Array.from(document.querySelectorAll("div,span,a,button"))
+      .map(element => ({ element, text: (element.innerText || element.textContent || "").trim(), rect: element.getBoundingClientRect(), cursor: getComputedStyle(element).cursor }))
+      .filter(item => item.text === "CONSOLE" || item.text === "LAUNCHER SETTINGS")
+      .filter(item => item.rect.top >= 28 && item.rect.top <= 72 && item.rect.width > 0 && item.rect.height > 0)
+      .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+    const label = exact[0]?.element || null;
+    if (!label) return null;
+    let nav = label;
+    for (let node = label.parentElement; node && node !== document.body; node = node.parentElement) {
       const rect = node.getBoundingClientRect();
-      const count = labels.filter(item => node.contains(item.element)).length;
-      if (count >= 2 && rect.top >= 0 && rect.top <= 90 && rect.height >= 24 && rect.height <= 90 && rect.width >= 400) {
-        return node;
-      }
+      const text = (node.innerText || node.textContent || "").trim();
+      if (!["CONSOLE", "LAUNCHER SETTINGS"].includes(text)) break;
+      if (rect.width >= nav.getBoundingClientRect().width && rect.height >= nav.getBoundingClientRect().height) nav = node;
     }
-    return first.parentElement;
+    return nav;
+  }
+  function activeSteamShellTab() {
+    if (!isSteamShellDocument()) return "";
+    const looksBlue = color => {
+      const match = String(color || "").match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+      if (!match) return false;
+      const r = Number(match[1]), g = Number(match[2]), b = Number(match[3]);
+      return b >= 180 && g >= 100 && r <= 80;
+    };
+    const labels = Array.from(document.querySelectorAll("div,span,a,button"))
+      .map(element => {
+        const style = getComputedStyle(element);
+        return { text: (element.innerText || element.textContent || "").trim(), rect: element.getBoundingClientRect(), color: style.color, borderBottomColor: style.borderBottomColor };
+      })
+      .filter(item => item.text && item.text !== "LAUNCHER SETTINGS" && item.rect.top >= 28 && item.rect.top <= 72);
+    const highlighted = labels.find(item => looksBlue(item.color) || looksBlue(item.borderBottomColor))?.text;
+    if (highlighted === "STORE" || highlighted === "LIBRARY") return highlighted;
+    if (highlighted) return "WEB";
+    const topText = Array.from(document.querySelectorAll("div,span,input"))
+      .map(element => ({ text: (element.value || element.innerText || element.textContent || "").trim(), rect: element.getBoundingClientRect() }))
+      .filter(item => item.rect.top >= 50 && item.rect.top <= 150 && item.rect.width > 80)
+      .map(item => item.text)
+      .join("\n");
+    if (/https?:\/\/store\.steampowered\.com|store\.steampowered\.com/i.test(topText)) return "STORE";
+    if (/https?:\/\/steamcommunity\.com|steamcommunity\.com/i.test(topText)) return "WEB";
+    if (/\/library(?:\/home|\/app\/|$)|tracking:.*\/library/i.test(topText)) return "LIBRARY";
+    return "";
+  }
+  window.__hubcapCdpGetActiveSurface = () => isStoreDocument() ? "STORE" : isSteamCommunityDocument() ? "WEB" : isSteamShellDocument() ? activeSteamShellTab() : "";
+  function wireLauncherSettingsNav() {
+    const nav = findConsoleNavElement();
+    if (!nav) return;
+    const label = Array.from(nav.querySelectorAll("div,span,a,button"))
+      .find(element => ["CONSOLE", "LAUNCHER SETTINGS"].includes((element.innerText || element.textContent || "").trim())) || nav;
+    if ((label.innerText || label.textContent || "").trim() !== "LAUNCHER SETTINGS") {
+      label.textContent = "LAUNCHER SETTINGS";
+    }
+    nav.title = "Hubcap launcher settings";
+    nav.dataset.hubcapLauncherSettingsNav = "true";
+    if (nav.dataset.hubcapLauncherSettingsBoundVersion !== UI_VERSION) {
+      nav.dataset.hubcapLauncherSettingsBoundVersion = UI_VERSION;
+      ["pointerdown", "mousedown", "pointerup", "mouseup"].forEach(type => listen(nav, type, event => {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        event.stopImmediatePropagation?.();
+      }, { capture: true }));
+      listen(nav, "click", event => openLauncherSettingsFromNav(event, nav), { capture: true });
+    }
+  }
+  function openLauncherSettingsFromNav(event, nav) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    event?.stopImmediatePropagation?.();
+    const panel = settingsPanel();
+    if (panel?.dataset.visible !== "true") window.__hubcapSettingsGloballyVisible = "false";
+    const anchor = settingsAnchorForElement(nav);
+    const activeSurface = window.__hubcapCdpGetActiveSurface();
+    window.__hubcapSettingsAnchor = anchor;
+    if (activeSurface && activeSurface !== "LIBRARY") {
+      if (panel) {
+        panel.dataset.visible = "false";
+        panel.style.removeProperty("display");
+      }
+      window.__hubcapSettingsGloballyVisible = "false";
+      window.__hubcapSettingsOpenedAt = Date.now();
+      send("toggleSettings", { ...(anchor || {}), settingsPreferSource: false, settingsSurface: activeSurface });
+      return;
+    }
+    if (panel?.dataset.visible === "true" || window.__hubcapSettingsGloballyVisible === "true") {
+      closeSettings(event);
+      return;
+    }
+    if (panel) panel.dataset.dragged = "false";
+    window.__hubcapSettingsGloballyVisible = "true";
+    window.__hubcapSettingsOpenedAt = Date.now();
+    revealSettingsPopup(anchor);
+    setSettingsNote("Loading...");
+    send("settings", { ...(anchor || {}), settingsPreferSource: true });
+  }
+  function startLauncherSettingsNavObserver() {
+    if (!isSteamShellDocument() || window.__hubcapLauncherSettingsNavObserver) return;
+    window.__hubcapLauncherSettingsNavObserver = new MutationObserver(() => wireLauncherSettingsNav());
+    window.__hubcapLauncherSettingsNavObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+    wireLauncherSettingsNav();
+  }
+  function positionShellStats(stats) {
+    if (!stats) return;
+    const topControls = Array.from(document.querySelectorAll("div,button,a"))
+      .filter(element => !element.closest?.(`#${TOP_STATS_ID},#${ROOT_ID},.hp-settings`))
+      .map(element => ({ element, rect: element.getBoundingClientRect() }))
+      .filter(item =>
+        item.rect.width >= 24 &&
+        item.rect.width <= 140 &&
+        item.rect.height >= 18 &&
+        item.rect.height <= 34 &&
+        item.rect.top >= 2 &&
+        item.rect.top <= 16 &&
+        item.rect.left > window.innerWidth - 520 &&
+        item.rect.left < window.innerWidth - 80
+      )
+      .sort((a, b) => a.rect.left - b.rect.left);
+    const firstControl = topControls[0]?.rect || null;
+    const width = Math.max(120, stats.getBoundingClientRect().width || 210);
+    const left = firstControl ? firstControl.left - width - 10 : window.innerWidth - width - 360;
+    const top = firstControl ? firstControl.top : 7;
+    stats.style.left = `${Math.max(8, Math.round(left))}px`;
+    stats.style.top = `${Math.max(4, Math.round(top))}px`;
+    stats.style.removeProperty("right");
   }
   function placeStats() {
     const stats = statsRoot();
     if (!stats || stats === root) return;
-    if (isSteamShellDocument() || isStoreDocument()) {
-      const host = document.body;
-      if (stats.parentElement !== host) host.appendChild(stats);
+    if (isSteamShellDocument()) {
+      if (stats.parentElement !== document.body) document.body.appendChild(stats);
       stats.dataset.compact = "true";
-      stats.dataset.shell = isSteamShellDocument() ? "true" : "false";
-      stats.dataset.store = isStoreDocument() ? "true" : "false";
-      stats.dataset.hidden = isStoreDocument() ? "true" : "false";
-      stats.style.removeProperty("left");
-      stats.style.removeProperty("top");
-      stats.style.removeProperty("right");
-      ensureSettingsPanelLayer();
+      stats.dataset.hidden = "false";
+      stats.dataset.shell = "true";
+      stats.dataset.store = "false";
+      stats.dataset.shellGlobal = "true";
+      stats.dataset.webHidden = "false";
+      stats.style.removeProperty("display");
+      positionShellStats(stats);
       return;
     }
+    stats.dataset.shellGlobal = "false";
+    if (isSteamWebDocument()) {
+      stats.dataset.webHidden = "true";
+      return;
+    }
+    stats.dataset.webHidden = "false";
     if (stats.parentElement !== root) root.appendChild(stats);
     stats.dataset.compact = "false";
     stats.dataset.shell = "false";
@@ -5949,15 +5987,46 @@ static class Scripts
     stats.style.removeProperty("top");
     stats.style.removeProperty("right");
   }
+  function resetRootPlacement() {
+    root.style.removeProperty("left");
+    root.style.removeProperty("position");
+    root.style.removeProperty("right");
+    root.style.removeProperty("top");
+    root.style.removeProperty("width");
+    root.style.removeProperty("z-index");
+  }
   function placeRoot() {
+    const activeSurface = window.__hubcapCdpGetActiveSurface();
+    root.dataset.webDocument = isSteamWebDocument() ? "true" : "false";
+    if (isSteamShellDocument() && activeSurface && activeSurface !== "LIBRARY") {
+      const panel = settingsPanel();
+      if (panel) {
+        panel.dataset.visible = "false";
+        panel.style.removeProperty("display");
+      }
+      window.__hubcapSettingsGloballyVisible = "false";
+    }
     const host = earlyHost();
     if (!looksLikeAppPage() || !host) {
+      const shellHost = isSteamShellDocument() && appIdFromUrl() && window.__hubcapCdpShellFallbackEnabled && activeSurface === "LIBRARY" ? shellContentHost() : null;
+      if (shellHost) {
+        root.style.display = "flex";
+        resetRootPlacement();
+        root.dataset.shellFallback = "true";
+        if (root.parentElement !== shellHost) shellHost.prepend(root);
+        placeStats();
+        return true;
+      }
       root.style.display = "none";
+      root.dataset.shellFallback = "false";
+      resetRootPlacement();
       if (!root.parentElement) document.body.prepend(root);
       placeStats();
-      return isStoreDocument() || isSteamShellDocument();
+      return isStoreDocument();
     }
     root.style.display = "flex";
+    root.dataset.shellFallback = "false";
+    resetRootPlacement();
     const title = document.querySelector(".apphub_AppName");
     const highlights = document.querySelector("#game_highlights");
     if (title?.parentElement === host && title.nextElementSibling !== root) title.insertAdjacentElement("afterend", root);
@@ -5968,6 +6037,7 @@ static class Scripts
     return true;
   }
   placeRoot();
+  startLauncherSettingsNavObserver();
   const send = (action, extra = {}) => {
     const payload = JSON.stringify({ action, appId: appIdFromUrl(), href: location.href, ...extra });
     if (typeof window.hubcapNative === "function") window.hubcapNative(payload);
@@ -6134,14 +6204,16 @@ static class Scripts
   }
   window.__hubcapCdpSetState = state => {
     placeRoot();
-    wireTopBarControls();
+    wireLauncherSettingsNav();
+    wireStatsControls();
     const stats = statsRoot();
     const button=root.querySelector(".hp-main"), library=root.querySelector(".hp-library"), status=root.querySelector(".hp-status"), warning=root.querySelector(".hp-warning"), usage=stats.querySelector(".hp-usage"), name=stats.querySelector(".hp-usage-name"), expiry=stats.querySelector(".hp-usage-expiry"), count=stats.querySelector(".hp-usage-count"), fill=stats.querySelector(".hp-usage-fill"), spinner=stats.querySelector(".hp-usage-spinner");
-    if(state.settingsOnly){showSettings(state.settings||{},!!state.settingsDraft,!(isSteamShellDocument()&&activeSteamShellTab()==="STORE"),state);if(state.statusText)setSettingsNote(state.statusText,state.statusTone||"idle");return;}
+    if(state.settingsOnly){showSettings(state.settings||{},!!state.settingsDraft,true,state);if(state.statusText)setSettingsNote(state.statusText,state.statusTone||"idle");return;}
     const denuvo=/denuvo|anti[-\s]?tamper/i.test(document.body?.innerText||"");
     warning.textContent="Warning: Denuvo / 3rd-party anti-tamper detected";
     warning.dataset.visible=denuvo?"true":"false"; button.dataset.denuvo=denuvo?"true":"false";
     if(state.busy){button.disabled=true;button.dataset.state="checking";button.dataset.busy="true";button.textContent=state.busyText||"Working...";status.textContent=state.statusText||"";status.dataset.tone="idle";spinner.dataset.visible=state.usageBusy?"true":"false";return;}
+    if(state.usageOnly&&!state.usage){spinner.dataset.visible=state.usageBusy?"true":"false";return;}
     if(state.usageOnly){updateUsage(state);return;}
     button.dataset.busy="false";
     if(state.exists){button.dataset.state="remove";button.textContent="Remove Lua";button.disabled=false;library.style.display="inline-flex";}
@@ -6158,17 +6230,22 @@ static class Scripts
       if(cached) window.__hubcapCdpSetState({usageOnly:true,usage:cached});
     }catch{}
   }
-  wireTopBarControls();
+  wireStatsControls();
+  startLauncherSettingsNavObserver();
   if (!root.dataset.bound) {
     listen(root.querySelector(".hp-main"), "click",()=>{const state=root.querySelector(".hp-main").dataset.state;if(state==="download")send("download");if(state==="remove")showRemoveConfirm(()=>send("remove"));});
     listen(root.querySelector(".hp-library"), "click",()=>send("library"));
     const stats = statsRoot();
     listen(document, "click", event=>{
+      const navSettings = event.target.closest?.("[data-hubcap-launcher-settings-nav='true']");
+      if(navSettings){openLauncherSettingsFromNav(event, navSettings);return;}
       if(event.target.closest?.(".hp-settings-button")){openSettings(event);event.stopImmediatePropagation?.();return;}
       if(event.target.closest?.(".hp-settings-close")){closeSettings(event);event.stopImmediatePropagation?.();return;}
       if(event.target.closest?.(`#${TOP_STATS_ID} .hp-usage`) && !event.target.closest?.(".hp-settings")){event.preventDefault();event.stopPropagation();event.stopImmediatePropagation?.();send("refresh");return;}
     }, { capture: true });
     listen(document, "click", async event=>{
+      const navSettings = event.target.closest?.("[data-hubcap-launcher-settings-nav='true']");
+      if(navSettings){openLauncherSettingsFromNav(event, navSettings);return;}
       const currentStats=statsRoot();
       const settingsButton=event.target.closest?.(".hp-settings-button");
       const settingsPanelHit=event.target.closest?.(".hp-settings");
@@ -6198,8 +6275,7 @@ static class Scripts
   let lastHubcapAppId=appIdFromUrl();
   hydrateCachedUsage();
   if(lastHubcapAppId){window.__hubcapCdpSetState({busy:true,busyText:"Checking...",statusText:"",usageBusy:true});setTimeout(()=>send("route"),0);}
-  else if(isSteamShellDocument()){window.__hubcapCdpSetState({usageOnly:true,usageBusy:true});setTimeout(()=>send("usage"),0);}
-  window.__hubcapCdpRouteTimer=setInterval(()=>{const nextAppId=appIdFromUrl();placeRoot();if(!nextAppId&&lastHubcapAppId){lastHubcapAppId="";window.__hubcapCdpSetState({usageOnly:true,usageBusy:false});return;}if(nextAppId&&nextAppId!==lastHubcapAppId){lastHubcapAppId=nextAppId;window.__hubcapCdpSetState({busy:true,busyText:"Checking...",statusText:"",usageBusy:true});send("route");}},150);
+  window.__hubcapCdpRouteTimer=setInterval(()=>{const nextAppId=appIdFromUrl();placeRoot();wireLauncherSettingsNav();if(!nextAppId&&lastHubcapAppId){lastHubcapAppId="";window.__hubcapCdpSetState({usageOnly:true,usageBusy:false});return;}if(nextAppId&&nextAppId!==lastHubcapAppId){lastHubcapAppId=nextAppId;window.__hubcapCdpSetState({busy:true,busyText:"Checking...",statusText:"",usageBusy:true});send("route");}},150);
   return {ok:true,href:location.href,appId:appIdFromUrl()};
 })()
 """;
